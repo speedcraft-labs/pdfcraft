@@ -2,11 +2,11 @@ use pdfcraft_render::{PageText, TextGlyph, text::fold_case};
 use std::ops::Range;
 
 fn page(parts: &[&str]) -> PageText {
-    PageText {
-        glyphs: parts.iter().map(|text| TextGlyph { text: (*text).into(), rect: [0.0; 4], quad: [[0.0; 2]; 4], direction: [1.0, 0.0] }).collect(),
-        line_of: vec![0; parts.len()],
-        space_before: vec![false; parts.len()],
-    }
+    let mut page = PageText::default();
+    page.glyphs = parts.iter().map(|text| TextGlyph { text: (*text).into(), rect: [0.0; 4], quad: [[0.0; 2]; 4], direction: [1.0, 0.0] }).collect();
+    page.line_of = vec![0; parts.len()];
+    page.space_before = vec![false; parts.len()];
+    page
 }
 
 // The original straightforward search is an independent oracle for valid page metadata.
@@ -109,4 +109,114 @@ fn long_repeated_prefix_search_preserves_the_last_match_and_limit() {
     let query = format!("{}b", "a".repeat(4095));
     assert_eq!(text.find_opts_limited(&query, false, false, 1), vec![126977..131073]);
     assert!(text.find(&format!("{}c", "a".repeat(4095))).is_empty());
+}
+
+/// Each query runs twice: the first call fills the page's fold cache (#128), the second reads
+/// it. Both must report exactly the uncached oracle's hits, for every option combination.
+#[test]
+fn repeat_queries_report_the_first_search_s_hits_from_the_fold_cache() {
+    let cases: &[(&[&str], &[u32], &[bool])] = &[
+        (&["İstanbul", "IRMAK", "Straße"], &[0, 0, 0], &[false, true, true]),
+        (&["under   state", "understate"], &[0, 0], &[false, true]),
+        (&["brown", "fox", "jumps"], &[0, 1, 1], &[false, false, true]),
+        (&[" ", "a", " ", " ", "b"], &[0, 0, 0, 0, 0], &[false, false, false, false, false]),
+        (&["e\u{301}clair", "CAFE", "café"], &[0, 0, 1], &[false, false, false]),
+    ];
+    let queries = ["istanbul", "ırmak", "straße", "strasse", "under state", "brown fox", "a b", "café", "cafe", "éclair", "É", ""];
+    for (parts, line_of, space_before) in cases {
+        let mut text = page(parts);
+        text.line_of = line_of.to_vec();
+        text.space_before = space_before.to_vec();
+        for query in queries {
+            for sensitive in [false, true] {
+                for whole in [false, true] {
+                    for limit in [1, 3, usize::MAX] {
+                        let (cold, expected) =
+                            (text.find_opts_limited(query, sensitive, whole, limit), reference(&text, query, sensitive, whole, limit));
+                        let cached = text.find_opts_limited(query, sensitive, whole, limit);
+                        assert_eq!(cold, expected, "{query:?} on {:?}: first (cold) search", parts);
+                        assert_eq!(cached, expected, "{query:?} on {:?}: repeat (cached) search", parts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A real extraction: the same differential as above, over pages rendered from a PDF with
+/// diacritics, drawn spaces, mixed case and a phrase that crosses a line break.
+#[test]
+fn cached_search_over_rendered_pdf_pages_matches_the_oracle() {
+    use pdfcraft_render::{PageRenderer, RenderConfig, RenderRequest, RequestKind};
+    use std::sync::Arc;
+
+    fn stream(contents: &[u8]) -> Vec<u8> {
+        let mut s = format!("<< /Length {} >>\nstream\n", contents.len()).into_bytes();
+        s.extend_from_slice(contents);
+        s.extend_from_slice(b"\nendstream");
+        s
+    }
+
+    // WinAnsi octal escapes: É = \311, é = \351, ç = \347, ß = \337.
+    let contents = [
+        b"BT /F1 12 Tf 72 700 Td (Cafe CAFE caf\\351 \\311CLAIR \\351clair) Tj ET".to_vec(),
+        b"BT /F1 12 Tf 72 700 Td (under   state) Tj 72 680 Td (understate Stra\\337e) Tj ET".to_vec(),
+        b"BT /F1 12 Tf 72 700 Td (brown) Tj 72 680 Td (fox jumps) Tj ET".to_vec(),
+    ];
+    let n = contents.len();
+    let kids: String = (0..n).map(|i| format!("{} 0 R ", 5 + 2 * i)).collect();
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>").into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+        b"<< /Font << /F1 3 0 R >> >>".to_vec(),
+    ];
+    for (i, content) in contents.iter().enumerate() {
+        objects.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] /Resources 4 0 R /Contents {} 0 R >>", 6 + 2 * i).into_bytes());
+        objects.push(stream(content));
+    }
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer << /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+
+    let mut renderer = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
+    let queries = ["café", "cafe", "éclair", "eclair", "under state", "understate", "straße", "strasse", "brown fox", "fox jumps", "CAFÉ"];
+    for page in 0..n {
+        let out = renderer.render(RenderRequest { page, kind: RequestKind::Text, tile: None, scale: 1.0, tag: 0, preview: false });
+        assert!(out.error.is_none(), "page {} text error: {:?}", page + 1, out.error);
+        let text = out.text.unwrap_or_default();
+        assert!(!text.is_empty(), "page {} has text", page + 1);
+        for query in queries {
+            for sensitive in [false, true] {
+                for whole in [false, true] {
+                    for limit in [2, usize::MAX] {
+                        let expected = reference(&text, query, sensitive, whole, limit);
+                        assert_eq!(
+                            text.find_opts_limited(query, sensitive, whole, limit),
+                            expected,
+                            "page {}, {query:?}, sensitive={sensitive}, whole={whole}, limit={limit}",
+                            page + 1
+                        );
+                        assert_eq!(
+                            text.find_opts_limited(query, sensitive, whole, limit),
+                            expected,
+                            "page {}, {query:?}: repeat (cached) search",
+                            page + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

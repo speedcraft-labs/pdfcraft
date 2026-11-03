@@ -740,7 +740,7 @@ fn a_match_ending_on_a_separator_stops_before_the_next_glyph() {
         let mut space_before = vec![false; 10];
         space_before[5] = !line_break;
         let line_of = (0..10).map(|i| u32::from(line_break && i >= 5)).collect();
-        let page = PageText { glyphs: glyphs.clone(), line_of, space_before };
+        let page = PageText { glyphs: glyphs.clone(), line_of, space_before, ..Default::default() };
         let plain = if line_break { "quick\nbrown" } else { "quick brown" };
         assert_eq!(page.plain_text(), plain);
         assert_eq!(page.find("quick "), vec![0..5]);
@@ -765,7 +765,7 @@ fn phrase_search_ignores_repeated_spaces() {
     v.push(g(" ", 52.0, 10.0, 58.0));
     word(&mut v, "brown", 58.0, 10.0, 6.0);
     let n = v.len();
-    let t = PageText { glyphs: v, line_of: vec![0; n], space_before: vec![false; n] };
+    let t = PageText { glyphs: v, line_of: vec![0; n], space_before: vec![false; n], ..Default::default() };
     assert_eq!(t.plain_text(), "quick  brown");
     assert_eq!(t.find("quick brown"), vec![0..12]);
     assert_eq!(t.find("quick  brown"), vec![0..12], "the query's own run of spaces is collapsed too");
@@ -1217,6 +1217,7 @@ fn words_and_lines_around_a_glyph() {
         })),
         line_of: vec![0, 0, 0, 0, 0, 1, 1, 1],
         space_before: vec![false, false, false, false, false, false, true, false],
+        ..Default::default()
     };
     assert_eq!(t.word_at(1), Some((0, 1)));
     assert_eq!(t.word_at(3), Some((3, 4)));
@@ -1716,6 +1717,7 @@ fn vertical_lines_keep_reading_order() {
         glyphs: vec![cell("日", 40.0, 10.0), cell("本", 40.0, 20.0), cell("語", 20.0, 10.0), cell("文", 20.0, 20.0)],
         line_of: vec![0, 0, 1, 1],
         space_before: vec![false; 4],
+        ..Default::default()
     };
     let all = t.glyphs_in([0.0, 0.0, 60.0, 40.0]);
     assert_eq!(t.column_text(&all), "日本\n語文");
@@ -1964,4 +1966,106 @@ fn text_outside_the_crop_box_is_clipped() {
         let text = extract_page(&pdf, 0, &InterpreterSettings::default()).unwrap();
         assert!(text.is_empty(), "expected no glyphs on {crop:?}, got {:?}", text.plain_text());
     }
+}
+
+/// A page of one-line words `words` with word gaps between them, for the fold-cache tests.
+fn fold_page_of(words: &[&str]) -> PageText {
+    let mut page = PageText::default();
+    let mut x = 0.0;
+    for (i, word) in words.iter().enumerate() {
+        let width = word.chars().count() as f32 * 6.0;
+        page.glyphs.push(em_box(word, x, 0.0, x + width, 10.0));
+        page.line_of.push(0);
+        page.space_before.push(i > 0);
+        x += width + 6.0;
+    }
+    page
+}
+
+#[test]
+fn folded_forms_are_built_once_per_options_and_equal_a_fresh_fold() {
+    let page = fold_page_of(&["İstanbul", "IRMAK", "Straße", "  spaced  words  "]);
+    for sensitive in [false, true] {
+        let first = page.folded_form(sensitive);
+        assert_eq!(*first, search::fold_page(&page, search::FoldOptions { sensitive }), "the cache must hold exactly the freshly folded form");
+        let second = page.folded_form(sensitive);
+        assert!(std::sync::Arc::ptr_eq(&first, &second), "a repeat query must reuse the cached form");
+    }
+    assert_eq!(page.fold_cache.builds(), 2, "one fold per option set");
+    assert_eq!(page.find("istanbul irmak straße").len(), 1);
+    assert_eq!(page.fold_cache.builds(), 2, "the public search path shares the cache");
+}
+
+#[test]
+fn editing_one_page_rebuilds_only_its_fold() {
+    let make = |tail: &str| fold_page_of(&["needle", tail]);
+    let mut pages = vec![make("one"), make("two"), make("three")];
+    for _ in 0..2 {
+        for page in &pages {
+            assert_eq!(page.find("needle"), vec![0..1]);
+        }
+    }
+    assert_eq!([0, 1, 2].map(|i| pages[i].fold_cache.builds()), [1, 1, 1], "each page folds once, repeat queries included");
+    // An edit hands out a whole new page (the renderer swaps the `Arc`), so only that page — and
+    // only its own fold — is rebuilt; the other pages' caches are untouched.
+    pages[1] = make("deux");
+    for page in &pages {
+        assert_eq!(page.find("needle"), vec![0..1]);
+    }
+    assert_eq!([0, 1, 2].map(|i| pages[i].fold_cache.builds()), [1, 1, 1], "only the replaced page folded again");
+    // An in-place edit of one page is caught by the content digest: that page refolds, the
+    // others keep their caches.
+    pages[2].glyphs[0].text = "tackle".into();
+    assert!(pages[2].find("needle").is_empty());
+    assert_eq!(pages[2].fold_cache.builds(), 2, "an edited text is refolded");
+    pages[0].line_of[1] = 1;
+    assert_eq!(pages[0].find("needle"), vec![0..1]);
+    assert_eq!(pages[0].fold_cache.builds(), 2, "edited layout is refolded too");
+}
+
+#[test]
+fn a_fold_cache_never_exceeds_its_byte_budget() {
+    let page = fold_page_of(&["needle", "in", "a", "haystack"]);
+    let options = |sensitive: bool| search::FoldOptions { sensitive };
+    let one_form = search::fold_page(&page, options(false)).len() * std::mem::size_of::<(char, usize)>();
+    let cache = search::FoldCache::with_budget(one_form);
+    cache.lookup_or_build(&page, options(false));
+    assert_eq!(cache.bytes(), one_form);
+    cache.lookup_or_build(&page, options(true));
+    assert_eq!(cache.bytes(), one_form, "the newer form evicts the least recently used one");
+    // A form that alone exceeds the budget is still served, just never kept.
+    let tiny = search::FoldCache::with_budget(one_form - 1);
+    assert_eq!(tiny.lookup_or_build(&page, options(false)), page.folded_form(false));
+    assert_eq!(tiny.bytes(), 0);
+}
+
+/// The query corpus for the fold-cache tests: case, diacritics, multi-word, absent.
+fn queries() -> [&'static str; 6] {
+    ["brown fox", "quick", "istanbul", "straße", "the fox", "missing"]
+}
+
+#[test]
+fn concurrent_queries_share_one_fold_cache() {
+    let page = std::sync::Arc::new(fold_page_of(&["The", "quick", "brown", "fox", "jumps", "İSTANBUL", "Straße"]));
+    let run = |page: &std::sync::Arc<PageText>| {
+        queries()
+            .iter()
+            .flat_map(|q| [false, true].map(|s| (q, s)))
+            .flat_map(|(q, s)| [false, true].map(|w| (q, s, w)))
+            .map(|(q, s, w)| page.find_opts(q, s, w))
+            .collect::<Vec<_>>()
+    };
+    let expected = run(&page);
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                let page = page.clone();
+                scope.spawn(move || run(&page))
+            })
+            .collect();
+        for run in runs {
+            assert_eq!(run.join().expect("no search thread panicked"), expected);
+        }
+    });
+    assert_eq!(page.fold_cache.builds(), 2, "the eight threads built each option set exactly once");
 }

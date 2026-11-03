@@ -73,7 +73,15 @@ fn main() {
     let glyphs: Vec<_> =
         text.chars().map(|c| TextGlyph { text: c.to_string(), rect: [0.0; 4], quad: [[0.0; 2]; 4], direction: [1.0, 0.0] }).collect();
     let n = glyphs.len();
-    let pages: Vec<_> = (0..300).map(|_| PageText { glyphs: glyphs.clone(), line_of: vec![0; n], space_before: vec![false; n] }).collect();
+    let pages: Vec<_> = (0..300)
+        .map(|_| {
+            let mut page = PageText::default();
+            page.glyphs = glyphs.clone();
+            page.line_of = vec![0; n];
+            page.space_before = vec![false; n];
+            page
+        })
+        .collect();
     for pass in ["first", "repeat"] {
         let start = Instant::now();
         for page in &pages {
@@ -97,7 +105,10 @@ fn main() {
         let glyphs: Vec<_> =
             text.chars().map(|c| TextGlyph { text: c.to_string(), rect: [0.0; 4], quad: [[0.0; 2]; 4], direction: [1.0, 0.0] }).collect();
         let n = glyphs.len();
-        let page = PageText { glyphs, line_of: vec![0; n], space_before: vec![false; n] };
+        let mut page = PageText::default();
+        page.glyphs = glyphs;
+        page.line_of = vec![0; n];
+        page.space_before = vec![false; n];
         black_box(page.find(&query));
         let mut times = Vec::new();
         for _ in 0..7 {
