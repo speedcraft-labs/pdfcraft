@@ -119,9 +119,10 @@ pub(crate) struct Editor {
     pub(crate) undo: Vec<Snapshot>,
     pub(crate) redo: Vec<Snapshot>,
     pub(crate) keys: Keys,
-    /// Display appearances built for annotations without any, reused while no annotation edit
-    /// runs (content edits leave every annotation dictionary alone). Cleared on any refresh
-    /// that may change annotations; see [`AppearanceCache`].
+    /// Display appearances built for annotations without any, reused across refreshes: each
+    /// entry is validated by a digest of the annotation dictionary it was drawn from, so an
+    /// edit redraws only the annotations it touched (#126); see
+    /// [`pdfcraft_annot::AppearanceCache`].
     pub(crate) appearances: AppearanceCache,
     /// Display appearances drawn for form fields the file leaves to the viewer (#3470), reused
     /// for each widget while the objects it was drawn from are unchanged; see

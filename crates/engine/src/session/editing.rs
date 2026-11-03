@@ -660,11 +660,9 @@ impl Session {
             Self::release_working(doc);
         }
         let Some(editor) = doc.editor.as_mut() else { return Ok(()) };
-        // Comment edits, and form edits (a script may change annotation properties), may change
-        // annotation dictionaries, invalidating cached appearances.
-        if matches!(scope, Scope::Comments | Scope::Form) {
-            editor.appearances.clear();
-        }
+        // Comment and form edits may change annotation dictionaries; the appearance cache
+        // validates each entry against the dictionary it was drawn from, so only the edited
+        // annotations redraw (#126).
         let bytes = if editor.cos.is_modified() {
             Arc::new(write_incremental(&editor.cos, &SaveOptions::default()).map_err(|e| EditError::Write(e.to_string()))?)
         } else {
@@ -1044,11 +1042,9 @@ impl Session {
     }
 
     fn refresh_with_indexes(doc: &mut Document, invalidate_markers: bool, invalidate_links: bool) -> Result<(), EditError> {
-        // A full refresh may follow structural or annotation changes: cached appearances
-        // may be stale, so they are rebuilt below.
-        if let Some(editor) = doc.editor.as_mut() {
-            editor.appearances.clear();
-        }
+        // A full refresh may follow structural or annotation changes; the appearance cache
+        // validates each entry against the dictionary it was drawn from, so untouched
+        // annotations are reused (#126).
         Self::release_working(doc);
         sync_xfa_state(doc);
         let Some(editor) = doc.editor.as_mut() else { return Ok(()) };

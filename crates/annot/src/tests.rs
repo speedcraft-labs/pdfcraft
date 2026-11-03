@@ -1507,6 +1507,237 @@ fn cached_appearances_are_reused_while_annotations_are_unchanged() {
     assert_eq!(a, b, "the reused appearance is byte-identical");
 }
 
+/// A one-page document whose page lists `count` Square comments without appearances, the shape
+/// files written by other programs carry them in. Object `4 + i` is comment `i`; `same` gives
+/// every comment the same rectangle, so their appearance streams have equal bytes.
+fn squares(count: usize, same: bool) -> Document {
+    let mut objs: Vec<Vec<u8>> =
+        vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec()];
+    let refs: Vec<String> = (0..count).map(|i| format!("{} 0 R", 4 + i)).collect();
+    objs.push(format!("<< /Type /Page /Parent 2 0 R /Annots [{}] >>", refs.join(" ")).into_bytes());
+    for i in 0..count {
+        let x = if same { 10 } else { 10 + i };
+        objs.push(format!("<< /Type /Annot /Subtype /Square /Rect [{x} 10 {} 50] /C [1 0 0] >>", if same { 60 } else { 60 + i }).into_bytes());
+    }
+    let bodies: Vec<&[u8]> = objs.iter().map(|o| o.as_slice()).collect();
+    document_of(&bodies)
+}
+
+/// Bytes of the appearance the display copy gave annotation `i` of page 0.
+fn appearance_bytes(doc: &Document, i: usize) -> usize {
+    let d = &list(doc, 0)[i];
+    let n = d.get(b"AP").and_then(|ap| doc.resolve(ap).as_dict().and_then(|ap| ap.reference(b"N"))).expect("an appearance");
+    match &*doc.get(n) {
+        Object::Stream(s) => s.raw.len(),
+        _ => 0,
+    }
+}
+
+/// #126: editing one annotation redraws only its appearance. The cache used to trust the
+/// annotation reference alone, so an edited dictionary was served the stale stream, and the
+/// engine answered by dropping every entry on any annotation-affecting refresh.
+#[test]
+fn editing_one_annotation_redraws_only_its_appearance() {
+    let mut doc = squares(50, false);
+    let mut cache = AppearanceCache::default();
+    let first = with_missing_appearances_cached(&doc, &mut cache).expect("50 comments need appearances");
+    assert_eq!((cache.builds(), cache.hits()), (50, 0));
+    let kept = ap_content(&first, &list(&first, 0)[3]);
+    assert!(!kept.is_empty());
+    // An edit the engine would make through a comment refresh: the dictionary changes under the
+    // same reference (a restyle, not a redraw with /AP of its own).
+    doc.update_dict(ObjRef::new(4 + 7, 0), |d| {
+        d.set(b"C".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(1), Object::Int(0)]));
+    })
+    .expect("edits");
+    let second = with_missing_appearances_cached(&doc, &mut cache).expect("one redraw");
+    assert_eq!((cache.builds(), cache.hits()), (51, 49), "one rebuild, 49 reuses");
+    assert!(ap_content(&second, &list(&second, 0)[7]).contains("0 1 0 RG"), "the edited comment is redrawn green");
+    assert_eq!(ap_content(&second, &list(&second, 0)[3]), kept, "an untouched comment keeps its appearance");
+}
+
+/// #126: deleting a comment drops its entry, and an edit that gives a comment its own `/AP`
+/// retires it the same way; the rest keep hitting.
+#[test]
+fn deleting_an_annotation_drops_its_cached_entry() {
+    let mut doc = squares(3, false);
+    let mut cache = AppearanceCache::default();
+    with_missing_appearances_cached(&doc, &mut cache).expect("builds");
+    assert_eq!((cache.builds(), cache.len()), (3, 3));
+    // The page stops listing the second comment (object 5).
+    let page = page_refs(&doc).unwrap()[0];
+    let kept: Vec<Object> = annots(&doc, page).into_iter().filter(|o| o.as_ref() != Some(ObjRef::new(5, 0))).collect();
+    doc.update_dict(page, move |d| d.set(b"Annots".to_vec(), Object::Array(kept))).expect("unlists");
+    with_missing_appearances_cached(&doc, &mut cache).expect("a refresh");
+    assert_eq!((cache.builds(), cache.hits()), (3, 2), "the two kept comments are reused");
+    assert_eq!(cache.len(), 2, "the unlisted comment's entry is dropped");
+}
+
+/// #126: the byte budget evicts single entries least-recently-used first instead of clearing
+/// the cache, and an entry larger than the whole budget is served without being kept.
+#[test]
+fn the_byte_budget_evicts_entries_instead_of_clearing() {
+    // Three equal appearances; the budget holds exactly two.
+    let sized = squares(3, true);
+    let one = {
+        let mut probe = AppearanceCache::default();
+        let display = with_missing_appearances_cached(&sized, &mut probe).expect("builds");
+        appearance_bytes(&display, 0)
+    };
+    assert!(one > 0);
+    let mut cache = AppearanceCache::with_budget(one.saturating_mul(2));
+    with_missing_appearances_cached(&sized, &mut cache).expect("builds three, keeps two");
+    assert_eq!((cache.builds(), cache.len()), (3, 2), "the oldest entry made room, the rest stayed");
+    assert!(cache.bytes() <= one.saturating_mul(2), "the budget holds");
+    with_missing_appearances_cached(&sized, &mut cache).expect("a refresh");
+    assert_eq!((cache.builds(), cache.hits()), (6, 0), "evicted entries rebuild, kept ones are served");
+    // One entry over the whole budget: drawn for display, never kept.
+    let mut tight = AppearanceCache::with_budget(one.saturating_sub(1));
+    with_missing_appearances_cached(&sized, &mut tight).expect("builds");
+    assert_eq!((tight.builds(), tight.len()), (3, 0), "nothing fits, nothing is kept");
+}
+
+/// Page resources, fonts and rotation are not inputs of an annotation appearance (it draws
+/// from the annotation dictionary alone, on built-in Helvetica metrics), so a page edit that
+/// touches no annotation rebuilds nothing.
+#[test]
+fn page_level_changes_rebuild_no_appearances() {
+    let mut doc = squares(3, false);
+    let mut cache = AppearanceCache::default();
+    let first = with_missing_appearances_cached(&doc, &mut cache).expect("builds");
+    let before: Vec<String> = list(&first, 0).iter().map(|d| ap_content(&first, d)).collect();
+    let page = page_refs(&doc).unwrap()[0];
+    doc.update_dict(page, |d| {
+        d.set(b"Rotate".to_vec(), Object::Int(90));
+        d.set(
+            b"Resources".to_vec(),
+            Object::Dict({
+                let mut r = Dict::new();
+                let mut fonts = Dict::new();
+                fonts.set(b"F9".to_vec(), Object::Ref(ObjRef::new(9, 0)));
+                r.set(b"Font".to_vec(), Object::Dict(fonts));
+                r
+            }),
+        );
+    })
+    .expect("edits the page");
+    let second = with_missing_appearances_cached(&doc, &mut cache).expect("a refresh");
+    assert_eq!((cache.builds(), cache.hits()), (3, 3), "no annotation dictionary changed, nothing redraws");
+    let after: Vec<String> = list(&second, 0).iter().map(|d| ap_content(&second, d)).collect();
+    assert_eq!(before, after, "the display bytes are unchanged");
+}
+
+/// The `/AP` dictionary the picture-stamp restyle reads its `/Matrix` through is reached from
+/// the annotation by reference, so the object it points at is part of the entry's key:
+/// replacing it redraws, even though the annotation dictionary itself did not change.
+#[test]
+fn the_ap_dictionary_the_build_reads_through_is_part_of_the_key() {
+    let doc = document_of(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        b"<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>",
+        b"<< /Type /Annot /Subtype /Stamp /Rect [100 100 200 180] /PCPicture 6 0 R /PCPictureSize [100 80] /AP 5 0 R >>",
+        b"<< /D 7 0 R >>",
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 80] /Length 0 >>\nstream\n\nendstream",
+        b"<< /Length 2 >>\nstream\nq\nendstream",
+    ]);
+    let mut doc = doc;
+    let mut cache = AppearanceCache::default();
+    let first = with_missing_appearances_cached(&doc, &mut cache).expect("the stamp is drawn");
+    assert_eq!((cache.builds(), cache.hits()), (1, 0));
+    // Replace the /AP dictionary object (same reference, new content).
+    let mut apd = Dict::new();
+    apd.set(b"D".to_vec(), Object::Array(vec![Object::Int(1), Object::Int(0), Object::Int(0), Object::Int(1), Object::Int(2), Object::Int(2)]));
+    doc.set(ObjRef::new(5, 0), Object::Dict(apd));
+    let second = with_missing_appearances_cached(&doc, &mut cache).expect("redraws");
+    assert_eq!((cache.builds(), cache.hits()), (2, 0), "the resolved /AP object is part of the digest");
+    assert_eq!(ap_content(&first, &list(&first, 0)[0]), ap_content(&second, &list(&second, 0)[0]), "redrawn from equal inputs, byte-identical");
+}
+
+/// An entry is keyed by dictionary content, not object identity: after an edit gave the
+/// comment its own `/AP` (what every engine comment edit does), restoring an equal dictionary
+/// through a fresh object (what undo's snapshot does) serves the cached appearance again.
+#[test]
+fn restoring_the_dictionary_content_serves_the_cached_appearance() {
+    let mut doc = squares(2, false);
+    let mut cache = AppearanceCache::default();
+    with_missing_appearances_cached(&doc, &mut cache).expect("builds");
+    assert_eq!((cache.builds(), cache.hits()), (2, 0));
+    let original = (*doc.get(ObjRef::new(4, 0))).clone();
+    doc.update_dict(ObjRef::new(4, 0), |d| {
+        d.set(b"C".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(1), Object::Int(0)]));
+        d.set(
+            b"AP".to_vec(),
+            Object::Dict({
+                let mut ap = Dict::new();
+                ap.set(b"N".to_vec(), Object::Ref(ObjRef::new(9, 0)));
+                ap
+            }),
+        );
+    })
+    .expect("edits");
+    with_missing_appearances_cached(&doc, &mut cache).expect("the edited comment now has its own /AP");
+    assert_eq!((cache.builds(), cache.hits()), (2, 1), "the edited comment is skipped, the other reused");
+    doc.set(ObjRef::new(4, 0), original);
+    with_missing_appearances_cached(&doc, &mut cache).expect("the restored dictionary hits");
+    assert_eq!((cache.builds(), cache.hits()), (2, 3), "equal content is a hit, whatever object holds it");
+}
+
+/// The engine reaches the cache behind `&mut` on one thread; behind a lock it is safe from
+/// eight at once, and the accounting stays exact.
+#[test]
+fn the_cache_is_safe_behind_a_lock_from_eight_threads() {
+    let doc = squares(64, false);
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(AppearanceCache::default()));
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let (doc, cache) = (&doc, &cache);
+            scope.spawn(move || {
+                let mut guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                with_missing_appearances_cached(doc, &mut guard).expect("builds");
+            });
+        }
+    });
+    let cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!((cache.builds(), cache.hits()), (64, 7 * 64), "one pass builds, seven reuse");
+    assert_eq!(cache.len(), 64);
+}
+
+/// #126 bench: 100 single-annotation edits over a 500-annotation page. The wholesale clear the
+/// engine did on every annotation-affecting refresh against the per-annotation digest:
+/// `rustup run stable cargo test -p pdfcraft-annot --release -- --ignored bench_ --nocapture`.
+#[test]
+#[ignore]
+fn bench_single_annotation_edits_over_500_annotations() {
+    let run = |clear_each_pass: bool| {
+        let mut doc = squares(500, true);
+        let mut cache = AppearanceCache::default();
+        with_missing_appearances_cached(&doc, &mut cache).expect("warms the cache");
+        let start = std::time::Instant::now();
+        let mut builds = 0;
+        for i in 0..100 {
+            let r = ObjRef::new(4 + i, 0);
+            doc.update_dict(r, |d| {
+                d.set(b"C".to_vec(), Object::Array(vec![Object::Int(i as i64 % 2), Object::Int(1), Object::Int(0)]));
+            })
+            .expect("edits");
+            if clear_each_pass {
+                cache.clear();
+            }
+            let before = cache.builds();
+            with_missing_appearances_cached(&doc, &mut cache).expect("a refresh");
+            builds += (cache.builds() - before) as usize;
+        }
+        (builds, start.elapsed())
+    };
+    let (cleared, cleared_in) = run(true);
+    let (kept, kept_in) = run(false);
+    eprintln!("wholesale clear per edit: {cleared} appearance builds in {cleared_in:?}");
+    eprintln!("per-annotation digest:    {kept} appearance builds in {kept_in:?}");
+    assert_eq!(cleared, 50_000, "a cleared cache redraws all 500 per edit");
+    assert_eq!(kept, 100, "each edit redraws only its own annotation");
+}
+
 /// A comment that `/Annots` lists many times, and that a second page lists too, is drawn once in
 /// the display copy. Every listing used to add another appearance stream, so a short array of
 /// repeated references multiplied the display bytes the engine writes on each refresh.

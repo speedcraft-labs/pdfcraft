@@ -3,6 +3,7 @@ use super::lookup::{annot_dict, annots, page_refs};
 use super::modify::refuse_foreign_text;
 use super::types::NOTE_SIZE;
 use super::{AnnotError, Dict, Document, ObjRef, Object, Stream, appearance};
+use pdfcraft_cos::serialize;
 
 /// (Re)generate `/AP /N` for the annotation `r` from its dictionary, for an edit that keeps its
 /// text (a restyle, a new size or colour).
@@ -90,48 +91,117 @@ fn apply_appearance(doc: &mut Document, r: ObjRef, d: &Dict, stream: Stream) -> 
 }
 
 /// Display appearances built for annotations without any, reused while the annotation
-/// dictionaries they were drawn from are unchanged.
+/// dictionaries they were drawn from are unchanged (#126).
 ///
 /// A content edit (moving a paragraph, retyping text, …) leaves every annotation dictionary
 /// alone, but the display copy is rebuilt from the edited document on every refresh: without
 /// this cache each refresh redrew every appearance (27k on one CAD file, ~0.7 s per edit
-/// commit). Entries are keyed by annotation reference; object numbers are never reused within
-/// a document lineage, so an entry stays valid until an annotation edit runs. Callers clear
-/// the cache on any refresh that may change annotations (comments, structural and full
-/// refreshes) and keep it for content-only ones.
-#[derive(Clone, Debug, Default)]
+/// commit). An entry is keyed by its annotation's reference and validated by a digest of
+/// everything [`build_appearance`] reads — the annotation dictionary's direct entries, plus
+/// the objects the build reads through by reference (the `/AP` dictionary a picture-stamp
+/// restyle takes its `/Matrix` from) — so an edited annotation is redrawn and every untouched
+/// one is reused, on comment edits, structural refreshes, undo and redo alike. The digest is
+/// of content, not object identity, so a snapshot restore of equal bytes is still a hit.
+/// Entries whose annotation is no longer listed (a deletion, or an edit that gave the comment
+/// its own `/AP`) are dropped by [`AppearanceCache::retain_listed`], and the byte budget
+/// evicts the least recently used entries instead of clearing the cache.
+#[derive(Clone, Debug)]
 pub struct AppearanceCache {
-    entries: std::collections::HashMap<ObjRef, Stream>,
+    entries: std::collections::HashMap<ObjRef, Entry>,
+    /// `(annotation, stamp of its use)` in use order. An entry used again leaves a stale
+    /// record behind; eviction skips those, and [`Self::compact`] drops them.
+    order: std::collections::VecDeque<(ObjRef, u64)>,
+    stamp: u64,
     bytes: usize,
+    budget: usize,
     hits: u64,
     builds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Entry {
+    digest: u128,
+    stream: Stream,
+    last_used: u64,
 }
 
 impl AppearanceCache {
     /// Cached appearance data restarts past this instead of growing without bound.
     const MAX_BYTES: usize = 64 << 20;
 
-    /// Forget every entry (an annotation edit may have changed the dictionaries).
-    pub fn clear(&mut self) {
-        *self = Self::default();
+    /// A cache with a smaller byte budget (tests and tools).
+    pub fn with_budget(budget: usize) -> Self {
+        Self { entries: Default::default(), order: Default::default(), stamp: 0, bytes: 0, budget, hits: 0, builds: 0 }
     }
 
-    fn get(&mut self, r: ObjRef) -> Option<Stream> {
-        let stream = self.entries.get(&r)?.clone();
+    /// Forget every entry (memory pressure, or a document the cache no longer belongs to).
+    pub fn clear(&mut self) {
+        *self = Self::with_budget(self.budget);
+    }
+
+    fn get(&mut self, r: ObjRef, digest: u128) -> Option<Stream> {
+        let stream = {
+            let entry = self.entries.get_mut(&r)?;
+            if entry.digest != digest {
+                return None;
+            }
+            self.stamp = self.stamp.saturating_add(1);
+            entry.last_used = self.stamp;
+            entry.stream.clone()
+        };
+        self.order.push_back((r, self.stamp));
+        self.compact();
         self.hits += 1;
         Some(stream)
     }
 
-    fn insert(&mut self, r: ObjRef, stream: &Stream) {
+    fn insert(&mut self, r: ObjRef, digest: u128, stream: &Stream) {
         self.builds += 1;
-        if self.entries.len() >= 1_000_000 {
-            self.clear();
+        if let Some(old) = self.entries.remove(&r) {
+            self.bytes = self.bytes.saturating_sub(old.stream.raw.len());
         }
-        if self.bytes.saturating_add(stream.raw.len()) <= Self::MAX_BYTES {
-            self.bytes += stream.raw.len();
-            self.entries.insert(r, stream.clone());
+        // One entry over the whole budget is served, just not kept.
+        if stream.raw.len() > self.budget {
+            return;
         }
-        // Else over budget: keep serving the entries already cached instead of growing.
+        self.bytes = self.bytes.saturating_add(stream.raw.len());
+        self.stamp = self.stamp.saturating_add(1);
+        let last_used = self.stamp;
+        self.entries.insert(r, Entry { digest, stream: stream.clone(), last_used });
+        self.order.push_back((r, last_used));
+        while self.bytes > self.budget {
+            let Some((candidate, at)) = self.order.pop_front() else { break };
+            // A record whose entry was used since is stale; the newer record evicts it.
+            if self.entries.get(&candidate).is_some_and(|e| e.last_used == at)
+                && let Some(evicted) = self.entries.remove(&candidate)
+            {
+                self.bytes = self.bytes.saturating_sub(evicted.stream.raw.len());
+            }
+        }
+    }
+
+    /// Drop the entries of annotations no page lists any more (a deleted comment, or one whose
+    /// edit wrote its own `/AP`). Called once per display pass with every listed annotation.
+    pub fn retain_listed(&mut self, listed: &std::collections::HashSet<ObjRef>) {
+        let mut bytes = self.bytes;
+        self.entries.retain(|r, e| {
+            if listed.contains(r) {
+                true
+            } else {
+                bytes = bytes.saturating_sub(e.stream.raw.len());
+                false
+            }
+        });
+        self.bytes = bytes;
+        self.order.retain(|(r, _)| self.entries.contains_key(r));
+    }
+
+    /// Drop the stale use records a re-touched entry left behind, so the queue stays
+    /// proportional to the entries.
+    fn compact(&mut self) {
+        if self.order.len() > self.entries.len().saturating_mul(2).saturating_add(64) {
+            self.order.retain(|(r, at)| self.entries.get(r).is_some_and(|e| e.last_used == *at));
+        }
     }
 
     /// Cache hits so far (reused appearances); for tests.
@@ -143,6 +213,62 @@ impl AppearanceCache {
     pub fn builds(&self) -> u64 {
         self.builds
     }
+
+    /// Entries currently held; for tests.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no entry is held; for tests.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Appearance bytes currently held; for tests.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Default for AppearanceCache {
+    fn default() -> Self {
+        Self::with_budget(Self::MAX_BYTES)
+    }
+}
+
+/// A 128-bit FNV-1a mix, one pass over the bytes.
+fn mix(hash: &mut u128, bytes: &[u8]) {
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    for &b in bytes {
+        *hash = (*hash ^ u128::from(b)).wrapping_mul(PRIME);
+    }
+}
+
+/// A digest of everything [`build_appearance`] reads from the document: each direct entry of
+/// the annotation dictionary — a reference hashed by identity, because an appearance embeds
+/// the reference, never the object behind it — plus, when the dictionary has an `/AP`, that
+/// dictionary resolved and its `/N` with it, the two objects the picture-stamp restyle reads
+/// its `/Matrix` through. Deterministic and content-addressed, so an object replaced with
+/// equal content (undo's snapshot restore) digests the same.
+fn appearance_digest(doc: &Document, d: &Dict) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    let mut scratch = Vec::new();
+    for (k, v) in d.iter() {
+        mix(&mut hash, &(k.len() as u128).to_le_bytes());
+        mix(&mut hash, k);
+        serialize(v, &mut scratch);
+        mix(&mut hash, &scratch);
+        if k.as_slice() == b"AP" {
+            let ap = doc.resolve(v);
+            serialize(&ap, &mut scratch);
+            mix(&mut hash, &scratch);
+            if let Some(n) = ap.as_dict().and_then(|ap| ap.get(b"N")) {
+                serialize(&doc.resolve(n), &mut scratch);
+                mix(&mut hash, &scratch);
+            }
+        }
+    }
+    hash
 }
 
 /// A copy of `doc` in which every annotation without a normal appearance (`/AP /N`) has the one
@@ -155,8 +281,9 @@ pub fn with_missing_appearances(doc: &Document) -> Option<Document> {
 }
 
 /// A copy of `doc` with [`AppearanceCache`] reuse across refreshes: annotations whose
-/// dictionary is unchanged since the cached build keep their stored appearance instead of
-/// redrawing it. See [`AppearanceCache`] for when entries stay valid.
+/// dictionary (and the objects its appearance reads through) is unchanged since the cached
+/// build keep their stored appearance instead of redrawing it. See [`AppearanceCache`] for
+/// when entries stay valid.
 pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCache) -> Option<Document> {
     let mut copy: Option<Document> = None;
     // An annotation listed more than once, on one page or several, is drawn once. `has_normal`
@@ -176,7 +303,8 @@ pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCac
             if has_normal {
                 continue;
             }
-            if let Some(stream) = cache.get(r) {
+            let digest = appearance_digest(doc, &d);
+            if let Some(stream) = cache.get(r, digest) {
                 // Fails only when `r` isn't a dictionary, which the cached build ruled out.
                 apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream).ok();
                 continue;
@@ -189,10 +317,11 @@ pub fn with_missing_appearances_cached(doc: &Document, cache: &mut AppearanceCac
                 appearance::display_stamp(&bare)
             };
             let Some(stream) = build_appearance(doc, &d).or_else(other_stamp) else { continue };
-            cache.insert(r, &stream);
+            cache.insert(r, digest, &stream);
             // Fails only when `r` isn't a dictionary, which the build just ruled out.
             apply_appearance(copy.get_or_insert_with(|| doc.clone()), r, &d, stream).ok();
         }
     }
+    cache.retain_listed(&seen);
     copy
 }

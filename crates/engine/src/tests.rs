@@ -10544,3 +10544,48 @@ fn imported_bookmarks_undo_in_one_step() {
     assert!(err.to_string().contains("no bookmark"), "{err}");
     assert!(s.get(id).unwrap().info.outline.is_empty());
 }
+
+/// A one-page PDF whose page lists `count` Square comments without appearances, as files
+/// written by other programs carry them (object `4 + i` is comment `i`).
+fn annotations_fixture(count: usize) -> Vec<u8> {
+    let mut objs: Vec<Vec<u8>> =
+        vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec()];
+    let refs: Vec<String> = (0..count).map(|i| format!("{} 0 R", 4 + i)).collect();
+    objs.push(format!("<< /Type /Page /Parent 2 0 R /Annots [{}] >>", refs.join(" ")).into_bytes());
+    for i in 0..count {
+        objs.push(format!("<< /Type /Annot /Subtype /Square /Rect [{} 10 {} 50] /C [1 0 0] >>", 10 + i, 60 + i).into_bytes());
+    }
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+/// #126: editing one comment on a page full of appearance-less comments redraws none of the
+/// others. The appearance cache used to be dropped wholesale on every annotation-affecting
+/// refresh, so one restyle re-derived every remaining appearance — and again on undo, and on a
+/// structural edit that touched no annotation at all.
+#[test]
+fn a_comment_edit_redraws_no_untouched_appearances() {
+    let mut s = Session::new();
+    let id = s.open("annotated.pdf", None, Arc::new(annotations_fixture(50)), None).expect("opens");
+    let builds = |s: &Session| s.get(id).unwrap().editor.as_ref().unwrap().appearances.builds();
+    assert_eq!(builds(&s), 50, "the first display pass draws every comment");
+    s.apply(id, Edit::StyleAnnotation { page: 0, index: 7, color: Some([1.0, 0.0, 0.0]), opacity: None, width: None, endings: None }).unwrap();
+    assert_eq!(builds(&s), 50, "the edit gave that comment its own /AP; the other 49 are reused");
+    s.undo(id).unwrap();
+    assert_eq!(builds(&s), 50, "undo restores the dictionary contents, so the original entries hit again");
+    s.apply(id, Edit::RotatePages { pages: vec![0], degrees: 90 }).unwrap();
+    assert_eq!(builds(&s), 50, "a structural change that touches no annotation dictionary redraws none");
+}
