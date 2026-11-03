@@ -354,16 +354,52 @@ fn write_revision(doc: &Document, opts: &SaveOptions, original: &[u8], base: u64
 /// writer, as the app does; this is the low-level form for saving a large document without a
 /// second copy of it in memory.
 pub fn save_in_place(doc: &Document, opts: &SaveOptions, path: &Path) -> Result<(), CosError> {
-    save_in_place_syncing(doc, opts, path, std::fs::File::sync_all)
+    save_in_place_syncing(doc, opts, path, std::fs::File::sync_all, None)
 }
 
+/// [`save_in_place`], giving the completed staging file to `check` before it replaces the
+/// target (#1698): the caller re-opens the file it is about to publish, and a refusal removes
+/// the staging file and leaves the target exactly as it was — a save that would not re-open
+/// never reaches the disk. This is the seam the engine's save path checks through.
+pub fn save_in_place_checking(doc: &Document, opts: &SaveOptions, path: &Path, check: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<(), CosError> {
+    save_in_place_syncing(doc, opts, path, std::fs::File::sync_all, Some(check))
+}
+
+/// Write `bytes` over the file at `path` through the same staging as [`save_in_place`]: staged,
+/// flushed and renamed, never truncating the target on the way. What the engine's save path
+/// uses for a document with nothing to append (a recovered document whose file was never
+/// written): the bytes are the document's own, already open elsewhere, so they are written as
+/// they are rather than through a revision.
+pub fn save_bytes_in_place(bytes: &[u8], path: &Path) -> Result<(), CosError> {
+    if std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().readonly()) {
+        return Err(CosError::Io("the file is read-only; save a copy with Save As".into()));
+    }
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("save");
+    let (tmp, mut file) = create_staging(dir, name)?;
+    let staged = file.write_all(bytes).map_err(|e| CosError::Io(e.to_string())).and_then(|()| {
+        keep_target_mode(path, &tmp);
+        std::fs::File::sync_all(&file).map_err(|e| CosError::Io(e.to_string()))
+    });
+    drop(file);
+    staged.and_then(|()| std::fs::rename(&tmp, path).map_err(|e| CosError::Io(e.to_string()))).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// A staged save's pre-publication check, when it has one: given the completed staging file,
+/// refuse the save — leaving the original as it was — by returning an error.
+type StagedCheck<'a> = Option<&'a dyn Fn(&Path) -> std::io::Result<()>>;
+
 /// [`save_in_place`] with the flush given, so a test can refuse it at the last step (the app's
-/// writer takes the same seam: `pdfcraft-platform`'s `write_atomically_syncing`).
+/// writer takes the same seam: `pdfcraft-platform`'s `write_atomically_syncing`), and the
+/// completed staging file optionally given to `check` before the rename.
 fn save_in_place_syncing(
     doc: &Document,
     opts: &SaveOptions,
     path: &Path,
     sync_all: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    check: StagedCheck<'_>,
 ) -> Result<(), CosError> {
     if doc.stream_limited() {
         return Err(CosError::ReadOnlyLimit);
@@ -433,6 +469,13 @@ fn save_in_place_syncing(
             write_revision(&doc, opts, &original, base, &mut file)?;
         }
         sync_all(&file).map_err(|e| CosError::Io(e.to_string()))?;
+        // The staged file is complete and durable: the caller's last look at it before it
+        // replaces the target, so a save that would not re-open never reaches the disk.
+        if let Some(check) = check
+            && let Err(e) = check(&tmp)
+        {
+            return Err(CosError::Io(e.to_string()));
+        }
         Ok(())
     })();
     // Closed before the rename, as Windows requires.
@@ -1338,11 +1381,75 @@ mod save_tests {
         let original = classic();
         std::fs::write(&path, &original).unwrap();
         let doc = edited(&Document::open(Arc::new(original.clone())).unwrap(), 0b11);
-        let error = save_in_place_syncing(&doc, &SaveOptions::default(), &path, |_| Err(std::io::Error::other("injected flush failure")))
+        let error = save_in_place_syncing(&doc, &SaveOptions::default(), &path, |_| Err(std::io::Error::other("injected flush failure")), None)
             .expect_err("the refused flush must fail the save");
         assert!(matches!(error, CosError::Io(_)), "{error:?}");
         assert_eq!(std::fs::read(&path).unwrap(), original, "the original must be untouched");
         only_the_document(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A save whose staged file fails the caller's check is never published: the original is
+    /// untouched and nothing is staged (#1698 through the in-place path, #55).
+    #[test]
+    fn a_refused_check_leaves_the_original_and_nothing_staged() {
+        let dir = temp_dir("check");
+        let path = dir.join("doc.pdf");
+        let original = classic();
+        std::fs::write(&path, &original).unwrap();
+        let doc = edited(&Document::open(Arc::new(original.clone())).unwrap(), 0b11);
+        let checked = std::cell::RefCell::new(None);
+        let error = save_in_place_checking(&doc, &SaveOptions::default(), &path, &|staged| {
+            *checked.borrow_mut() = Some(staged.to_path_buf());
+            Err(std::io::Error::other("injected reopen failure"))
+        })
+        .expect_err("the refused check must fail the save");
+        assert!(matches!(error, CosError::Io(_)), "{error:?}");
+        let staged = checked.into_inner().expect("the completed staging file was given to the check");
+        assert!(staged.starts_with(&dir), "the checked file is the staging one: {staged:?}");
+        assert_ne!(staged, path);
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the original must be untouched");
+        only_the_document(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A passing check publishes, and what it saw is exactly the file that lands on the target.
+    #[test]
+    fn a_passing_check_sees_the_staged_file_that_is_published() {
+        let dir = temp_dir("check-ok");
+        let path = dir.join("doc.pdf");
+        let original = classic();
+        std::fs::write(&path, &original).unwrap();
+        let doc = edited(&Document::open(Arc::new(original.clone())).unwrap(), 0b11);
+        let checked = std::cell::RefCell::new(Vec::new());
+        save_in_place_checking(&doc, &SaveOptions::default(), &path, &|staged| {
+            let bytes = std::fs::read(staged).map_err(|e| std::io::Error::other(e.to_string()))?;
+            checked.borrow_mut().extend(bytes);
+            Ok(())
+        })
+        .unwrap();
+        let published = std::fs::read(&path).unwrap();
+        assert_eq!(checked.into_inner(), published, "the file published is the file that was checked");
+        assert!(published.starts_with(&original), "an incremental save only appends");
+        only_the_document(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `save_bytes_in_place` replaces a file with the given bytes through staging, and a file
+    /// that is not there yet (a recovered document) is simply created.
+    #[test]
+    fn save_bytes_in_place_replaces_or_creates_through_staging() {
+        let dir = temp_dir("bytes");
+        let path = dir.join("doc.pdf");
+        let original = classic();
+        std::fs::write(&path, &original).unwrap();
+        let replacement = write_full(&Document::open(Arc::new(original.clone())).unwrap(), &SaveOptions::default()).unwrap();
+        save_bytes_in_place(&replacement, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        only_the_document(&dir);
+        let fresh = dir.join("new.pdf");
+        save_bytes_in_place(&replacement, &fresh).unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), replacement);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

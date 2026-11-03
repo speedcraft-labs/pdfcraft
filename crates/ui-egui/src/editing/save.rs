@@ -131,7 +131,7 @@ impl PdfCraftApp {
             self.dialog = Some(crate::Dialog::OverwriteChanged);
             return false;
         }
-        let saved = self.save_doc_to(id, dest, target);
+        let saved = self.save_doc_to(id, dest, target, false);
         if saved {
             after(self);
         }
@@ -142,7 +142,7 @@ impl PdfCraftApp {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn overwrite_changed_file(&mut self) {
         let Some(p) = self.pending_overwrite.take() else { return };
-        if self.save_doc_to(p.id, &p.dest, p.target) {
+        if self.save_doc_to(p.id, &p.dest, p.target, true) {
             (p.after)(self);
         }
     }
@@ -157,14 +157,17 @@ impl PdfCraftApp {
     }
 
     /// Write document `id` to `dest` and make it the document's file. Returns `true` if written.
+    /// `overwrite_changed` is the user's Save anyway on a file that changed on disk: the file is
+    /// replaced from its staged bytes rather than appended to, since the bytes there are not the
+    /// revision this document knows (#2166).
     #[cfg(not(target_arch = "wasm32"))]
-    fn save_doc_to(&mut self, id: pdfcraft_engine::DocId, dest: &str, target: SaveTarget) -> bool {
+    fn save_doc_to(&mut self, id: pdfcraft_engine::DocId, dest: &str, target: SaveTarget, overwrite_changed: bool) -> bool {
         // Save As answers on a later frame: commit what was typed meanwhile, too (#166), even
         // if another tab is active by then.
         if !self.commit_typing_in(id) || !self.flatten_fill_sign_for_save(id) {
             return false;
         }
-        let Some((name, full)) = self.session.get(id).map(|d| {
+        let Some((full, own)) = self.session.get(id).map(|d| {
             // Save As to another file is a clean copy, without the earlier revisions that still
             // hold deleted pages or replaced text (#2165). A signed document stays incremental so
             // its signatures keep covering the file.
@@ -172,26 +175,43 @@ impl PdfCraftApp {
                 && !d.path.as_deref().is_some_and(|p| crate::same_file(p, dest))
                 && d.read_only_reason.is_none()
                 && !d.is_signed();
-            (d.name.clone(), full)
+            (full, d.path.as_deref().is_some_and(|p| crate::same_file(p, dest)))
         }) else {
             self.notify_tr("The document was closed before it could be saved.");
             return false;
         };
-        let bytes = if full { self.session.save_full_bytes(id) } else { self.session.save_bytes(id) };
-        let bytes = match bytes.and_then(|b| self.session.check_save(id, &b).map(|()| b)) {
-            Ok(b) => b,
-            Err(e) => {
-                self.notify_fmt("Couldn't save {name}: {e}", &[("name", &name), ("e", &e.to_string())]);
-                return false;
-            }
+        // The document's own file, saved without a rewrite due: the revision is appended to the
+        // bytes already on the disk through the engine's atomic staging (#55), so the file is
+        // never copied into memory, and the staged file is re-opened before it replaces the
+        // target (#1698). Save As and a full rewrite stream into a staging file beside their
+        // destination the same way.
+        let saved = if own && !full && !overwrite_changed {
+            self.session.save_in_place(id, dest).map_err(|e| e.to_string())
+        } else {
+            let mut stream = |file: &mut std::fs::File| {
+                let saved = if full { self.session.save_full_bytes_to(id, file) } else { self.session.save_bytes_to(id, file) };
+                saved.map_err(|e| std::io::Error::other(e.to_string()))
+            };
+            let check = |staged: &std::path::Path| {
+                self.session.check_saved_file(id, &staged.to_string_lossy()).map_err(|e| std::io::Error::other(e.to_string()))
+            };
+            pdfcraft_platform::staging::stage_atomically_with(
+                std::path::Path::new(dest),
+                StagingName::TagThenSuffix,
+                staging_suffixes(),
+                std::fs::File::sync_all,
+                &mut stream,
+                &check,
+            )
+            .map_err(|e| e.to_string())
         };
-        if let Err(e) = write_atomically(dest, &bytes) {
-            self.notify_fmt("Couldn't save {name}: {e}", &[("name", dest), ("e", &e.to_string())]);
+        if let Err(e) = saved {
+            self.notify_fmt("Couldn't save {name}: {e}", &[("name", dest), ("e", &e)]);
             return false;
         }
         // Our own write is not a change on disk to reload (#431).
         self.watch.known_now(id, dest);
-        match self.session.mark_saved(id, bytes, Some(dest.to_string())) {
+        match self.session.mark_saved_file(id, dest) {
             Ok(()) => {
                 self.forget_recovery(id);
                 if let Some(doc) = self.session.get(id)

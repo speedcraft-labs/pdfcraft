@@ -1055,6 +1055,208 @@ fn full_save_is_readable_and_smaller_after_deletes() {
     assert_eq!(page_texts(&s2, id2), ["Page 4", "Page 5"]);
 }
 
+/// A folder for a save test, empty and removed only by the test that made it.
+fn save_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pdfcraft-engine-save-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A sticky note on page 0 of `id`, the annotation a save test edits.
+fn note_edit() -> Edit {
+    let shape = Shape::Note { at: [100.0, 280.0], icon: NoteIcon::Comment };
+    Edit::AddAnnotation(NewAnnotation { page: 0, style: Style::default_for(&shape), shape, contents: "First".into(), author: "Ada".into() })
+}
+
+/// The desktop Save appends to the document's own file in place (#55): the original bytes stay
+/// first, the engine rebases on the file, and a save → reopen → edit → save chain leaves three
+/// revisions, every one of them readable by pdfcraft's reader and by hayro.
+#[test]
+fn in_place_saves_append_and_leave_three_readable_revisions() {
+    let dir = save_dir("chain");
+    let path = dir.join("doc.pdf");
+    let path_str = path.to_string_lossy().into_owned();
+    let original = fixture(2);
+    std::fs::write(&path, &original).unwrap();
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("doc.pdf", Some(path_str.clone()), Arc::new(original.clone()), None).unwrap();
+    s.apply(id, note_edit()).unwrap();
+    s.save_in_place(id, &path_str).unwrap();
+    let first = std::fs::read(&path).unwrap();
+    assert!(first.starts_with(&original), "an in-place save only appends");
+    assert!(first.len() > original.len(), "the annotation is in the file");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no staging file is left behind");
+    s.mark_saved_file(id, &path_str).unwrap();
+    assert!(!s.get(id).unwrap().dirty, "the saved document is clean");
+    assert_eq!(s.get(id).unwrap().bytes.as_slice(), first.as_slice(), "the file is the working bytes");
+
+    // Reopen the saved file, edit the other page, save again: the third revision.
+    let mut s2 = Session::new().with_clock(|| 1_700_000_001);
+    let id2 = s2.open("doc.pdf", Some(path_str.clone()), Arc::new(first), None).unwrap();
+    let shape = Shape::Note { at: [40.0, 40.0], icon: NoteIcon::Help };
+    s2.apply(
+        id2,
+        Edit::AddAnnotation(NewAnnotation { page: 1, style: Style::default_for(&shape), shape, contents: "Second".into(), author: "Bob".into() }),
+    )
+    .unwrap();
+    s2.save_in_place(id2, &path_str).unwrap();
+    s2.mark_saved_file(id2, &path_str).unwrap();
+
+    let saved = std::fs::read(&path).unwrap();
+    let ends = pdfcraft_cos::Document::open(Arc::new(saved.clone())).unwrap().revision_ends();
+    assert_eq!(ends.len(), 3, "the chain grew two revisions on the original: {ends:?}");
+    for (i, end) in ends.iter().enumerate() {
+        let revision = Arc::new(saved.get(..*end).unwrap_or(&saved).to_vec());
+        pdfcraft_cos::Document::open(revision.clone()).unwrap_or_else(|e| panic!("revision {} opens in pdfcraft: {e}", i + 1));
+        let pages = hayro_syntax::Pdf::new(revision).unwrap_or_else(|e| panic!("revision {} opens in hayro: {e:?}", i + 1)).pages().len();
+        assert_eq!(pages, 2, "revision {} has both pages in hayro", i + 1);
+    }
+    let mut s3 = Session::new();
+    let id3 = s3.open("doc.pdf", Some(path_str), Arc::new(saved), None).unwrap();
+    assert_eq!(s3.get(id3).unwrap().info.annotations.len(), 2, "both annotations survived the chain");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fault at the last step of an in-place save — here the pre-publication check — leaves the
+/// original file exactly as it was, with no staging beside it (#55).
+#[test]
+fn a_fault_at_the_last_step_of_an_in_place_save_leaves_the_original() {
+    let dir = save_dir("fault");
+    let path = dir.join("doc.pdf");
+    let path_str = path.to_string_lossy().into_owned();
+    let original = fixture(1);
+    std::fs::write(&path, &original).unwrap();
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("doc.pdf", Some(path_str.clone()), Arc::new(original.clone()), None).unwrap();
+    s.apply(id, note_edit()).unwrap();
+    let error = s.save_in_place_checking(id, &path_str, &|_| Err(std::io::Error::other("injected reopen failure"))).unwrap_err();
+    assert!(matches!(error, EditError::Write(_)), "{error:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), original, "the original must be untouched");
+    let left: Vec<std::ffi::OsString> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left.len(), 1, "staging left behind: {left:?}");
+    assert!(s.get(id).unwrap().dirty, "the failed save leaves the document unsaved");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A document restored from a recovery snapshot has edits its file on disk never saw: an
+/// in-place save with nothing new to append still writes its bytes where they belong (#55).
+#[test]
+fn an_in_place_save_of_a_recovered_document_writes_its_file() {
+    let dir = save_dir("recovered");
+    let path = dir.join("doc.pdf");
+    let path_str = path.to_string_lossy().into_owned();
+    let original = fixture(1);
+    std::fs::write(&path, &original).unwrap();
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("doc.pdf", None, Arc::new(original), None).unwrap();
+    s.apply(id, Edit::SetInfo { key: "Title".into(), value: "Recovered".into() }).unwrap();
+    let recovery = s.save_bytes(id).unwrap();
+    let mut restored = Session::new();
+    let rid = restored.open("doc.pdf", None, recovery.clone(), None).unwrap();
+    restored.mark_recovered(rid, Some(path_str.clone()));
+    assert!(restored.get(rid).unwrap().dirty);
+    restored.save_in_place(rid, &path_str).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), recovery.as_slice(), "the working bytes reach the disk");
+    restored.mark_saved_file(rid, &path_str).unwrap();
+    assert!(!restored.get(rid).unwrap().dirty);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A one-page scanned document of `size` bytes: one huge content stream, the shape of a scan.
+fn scanned(size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size + 1024);
+    out.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = Vec::new();
+    for (i, body) in [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 4 0 R >>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    offsets.push(out.len());
+    out.extend_from_slice(format!("4 0 obj\n<< /Length {size} >>\nstream\n").as_bytes());
+    out.extend(std::iter::repeat_n(b'0', size));
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// What a save hands its writer: the largest single buffer (the biggest thing it built in
+/// memory) and the total, as in `cos`'s writer tests (#55). Everything a save writes passes
+/// through here, so a save that never holds the file it is copying never asks for a buffer
+/// anywhere near its size.
+struct Measured {
+    file: std::fs::File,
+    max_write: usize,
+    total: usize,
+}
+
+impl std::io::Write for Measured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.max_write = self.max_write.max(buf.len());
+        self.total += buf.len();
+        self.file.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Saving a 200 MB document edits one annotation and writes its file without ever building a
+/// second copy of the document in memory: the original goes through in 64 KiB pieces and the
+/// revision (one annotation) behind them, in the streamed form and in the in-place one (#55).
+#[ignore = "builds a 200 MB document; run with cargo test -- --ignored"]
+#[test]
+fn a_200_mb_save_allocates_like_its_revision_not_like_its_file() {
+    use std::io::Write as _;
+    const SIZE: usize = 200 * 1024 * 1024;
+    let dir = save_dir("large");
+    let out = dir.join("streamed.pdf");
+    let own = dir.join("scan.pdf");
+    let bytes = Arc::new(scanned(SIZE));
+    std::fs::write(&own, bytes.as_slice()).unwrap();
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("scan.pdf", Some(own.to_string_lossy().into_owned()), bytes, None).unwrap();
+    s.apply(id, note_edit()).unwrap();
+
+    let mut sink = Measured { file: std::fs::File::create(&out).unwrap(), max_write: 0, total: 0 };
+    s.save_bytes_to(id, &mut sink).unwrap();
+    sink.flush().unwrap();
+    let (max_write, total) = (sink.max_write, sink.total);
+    drop(sink);
+    // The original went through in 64 KiB pieces — never one buffer near the file's size — and
+    // the whole save wrote only a little more than the file itself: the revision, nothing else.
+    assert_eq!(max_write, 64 * 1024, "the largest buffer handed over");
+    assert!(total > SIZE, "the original was streamed through: {total}");
+    assert!(total < SIZE + 1024 * 1024, "the revision is one annotation: {}", total - SIZE);
+    let streamed = std::fs::read(&out).unwrap();
+    assert_eq!(streamed.len(), total);
+
+    // The document's own file saves in place the same way: appended to, never rewritten, and
+    // the revision is the same one the streamed form wrote.
+    s.save_in_place(id, &own.to_string_lossy()).unwrap();
+    let in_place = std::fs::read(&own).unwrap();
+    assert_eq!(in_place, streamed, "the in-place save appends the same revision the streamed one wrote");
+    let reopened = pdfcraft_cos::Document::open(Arc::new(in_place.clone())).unwrap();
+    assert!(reopened.repair_log().is_empty(), "{:?}", reopened.repair_log());
+    assert_eq!(reopened.revisions().len(), 2);
+    assert_eq!(hayro_syntax::Pdf::new(Arc::new(in_place)).expect("hayro opens the saved scan").pages().len(), 1);
+    s.mark_saved_file(id, &own.to_string_lossy()).unwrap();
+    assert!(!s.get(id).unwrap().dirty);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn layer_choices_survive_edits() {
     // No layers in the fixture: just make sure refresh keeps working with an empty list and

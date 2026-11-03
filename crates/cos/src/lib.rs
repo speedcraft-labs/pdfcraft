@@ -30,7 +30,9 @@ pub use parser::{Lexer, is_whitespace, parse_indirect};
 pub use pdfcraft_crypt::{
     Algorithm, Auth, Method as CryptMethod, NewEncryption, Permissions, SecurityHandler, effective_password, pdfdoc_byte, pdfdoc_char,
 };
-pub use writer::{SaveOptions, pdf_date, save_in_place, serialize, write_full, write_incremental, write_incremental_to};
+pub use writer::{
+    SaveOptions, pdf_date, save_bytes_in_place, save_in_place, save_in_place_checking, serialize, write_full, write_incremental, write_incremental_to,
+};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CosError {

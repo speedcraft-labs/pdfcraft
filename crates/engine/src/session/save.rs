@@ -1,22 +1,28 @@
+use std::io::Write;
+
 use super::{
     Arc, DocId, EditError, Keys, OpenError, RecoverySnapshot, RenderPool, SaveOptions, Session, SignOptions, TrustStore, display_bytes,
-    display_config, guard, render_threads, signatures_of, writable, write_full, write_incremental, xfa_sync_datasets,
+    display_config, guard, render_threads, signatures_of, writable, write_full, write_incremental, write_incremental_to, xfa_sync_datasets,
 };
 
+/// What a save writes, shared by its buffered and streamed forms (#55).
+enum SavePlan {
+    /// Nothing was edited since the file was last saved (or opened): its bytes are the save.
+    Unchanged(Arc<Vec<u8>>),
+    /// The graph to write and the options it is written with.
+    Write(Box<pdfcraft_cos::Document>, SaveOptions),
+}
+
 impl Session {
-    /// The bytes to write for Save: an incremental update of the file as opened/last saved,
-    /// with `/ModDate` stamped. Call `mark_saved` after writing them successfully.
-    ///
-    /// A file whose cross-reference data had to be rebuilt is written in full even when nothing
-    /// was edited: its bytes as opened are the damaged file, and this save is how the repair the
-    /// user was told about reaches the disk (#1937). Not a signed one: a full rewrite would
-    /// break its signatures, so with no edits it keeps its bytes, damage and all.
-    pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+    /// What Save writes for `id`: the file as it stands when nothing changed, or the document
+    /// and options to write. This is [`Session::save_bytes`]'s decision, shared with its
+    /// streamed and in-place forms.
+    fn save_plan(&self, id: DocId) -> Result<SavePlan, EditError> {
         let doc = self.get(id).ok_or(EditError::NoDocument)?;
-        let Some(editor) = doc.editor.as_ref() else { return Ok(doc.bytes.clone()) };
+        let Some(editor) = doc.editor.as_ref() else { return Ok(SavePlan::Unchanged(doc.bytes.clone())) };
         let on_saved = Arc::ptr_eq(editor.cos.bytes(), &editor.saved);
         if !editor.cos.is_modified() && on_saved && (!editor.cos.reconstructed() || doc.is_signed()) {
-            return Ok(editor.saved.clone());
+            return Ok(SavePlan::Unchanged(editor.saved.clone()));
         }
         // What the user removed again before saving (a cleared redaction mark) stays out of the file.
         let opts = SaveOptions { mod_date: self.now().map(pdfcraft_cos::pdf_date), drop_unlinked: true, ..SaveOptions::default() };
@@ -25,18 +31,49 @@ impl Session {
         // a reconstructed file) still writes the current graph on its own.
         let rewrite = editor.cos.full_save_required() || editor.cos.encryption_changed() || editor.cos.revisions().is_empty();
         let cos = writable(&editor.cos)?;
-        guard(|| {
-            if on_saved || rewrite {
-                write_incremental(&cos, &opts)
+        let (saved, reopen) = (editor.saved.clone(), editor.saved_keys.reopen.clone());
+        guard(move || {
+            let doc = if on_saved || rewrite {
+                cos.into_owned()
             } else {
-                let mut base = pdfcraft_cos::Document::open_with_password(editor.saved.clone(), editor.saved_keys.reopen.as_deref())?;
-                base.overlay_changes_from(&cos)?;
-                write_incremental(&base, &opts)
-            }
+                let mut base = pdfcraft_cos::Document::open_with_password(saved, reopen.as_deref()).map_err(|e| e.to_string())?;
+                base.overlay_changes_from(&cos).map_err(|e| e.to_string())?;
+                base
+            };
+            Ok::<_, String>(SavePlan::Write(Box::new(doc), opts))
         })
         .map_err(EditError::Write)?
-        .map(Arc::new)
-        .map_err(|e| EditError::Write(e.to_string()))
+        .map_err(EditError::Write)
+    }
+
+    /// The bytes to write for Save: an incremental update of the file as opened/last saved,
+    /// with `/ModDate` stamped. Call `mark_saved` after writing them successfully.
+    ///
+    /// A file whose cross-reference data had to be rebuilt is written in full even when nothing
+    /// was edited: its bytes as opened are the damaged file, and this save is how the repair the
+    /// user was told about reaches the disk (#1937). Not a signed one: a full rewrite would
+    /// break its signatures, so with no edits it keeps its bytes, damage and all.
+    pub fn save_bytes(&self, id: DocId) -> Result<Arc<Vec<u8>>, EditError> {
+        match self.save_plan(id)? {
+            SavePlan::Unchanged(bytes) => Ok(bytes),
+            SavePlan::Write(cos, opts) => {
+                guard(|| write_incremental(&cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
+            }
+        }
+    }
+
+    /// [`Self::save_bytes`], streamed to `out` (#55): the original goes through in chunks and
+    /// the revision is written behind it, so a save never holds a second copy of the document
+    /// in memory. The bytes are the ones [`Self::save_bytes`] returns; callers that write a
+    /// staging file take them this way, and [`Self::save_in_place`] is the form for the
+    /// document's own file.
+    pub fn save_bytes_to(&self, id: DocId, out: &mut impl Write) -> Result<(), EditError> {
+        match self.save_plan(id)? {
+            SavePlan::Unchanged(bytes) => out.write_all(&bytes).map_err(|e| EditError::Write(e.to_string())),
+            SavePlan::Write(cos, opts) => {
+                guard(|| write_incremental_to(&cos, &opts, out)).map_err(EditError::Write)?.map_err(|e| EditError::Write(e.to_string()))
+            }
+        }
     }
 
     /// A compact, garbage-collected rewrite (Save As ▸ "Optimized" / Reduce File Size groundwork).
@@ -51,6 +88,51 @@ impl Session {
         guard(|| write_full(&cos, &opts)).map_err(EditError::Write)?.map(Arc::new).map_err(|e| EditError::Write(e.to_string()))
     }
 
+    /// [`Self::save_full_bytes`], streamed to `out`: the rewrite is built in memory (it
+    /// renumbers the whole document) and written to the caller's staging file as one buffer,
+    /// never kept as the document's working bytes on top of that (#55).
+    pub fn save_full_bytes_to(&self, id: DocId, out: &mut impl Write) -> Result<(), EditError> {
+        let file = self.save_full_bytes(id)?;
+        out.write_all(&file).map_err(|e| EditError::Write(e.to_string()))
+    }
+
+    /// Save over the document's own file at `path` (#55): an incremental update is appended to
+    /// the bytes already on the disk — staged beside the file, flushed, checked and only then
+    /// renamed over it — so a save never holds a second copy of the document in memory and a
+    /// crash, a full disk or a refused step leaves the file exactly as it was. A document that
+    /// must be rewritten in full goes through the same staging, and one with nothing to write
+    /// whose file is missing or shorter (a document restored from a recovery snapshot) has its
+    /// bytes staged over the path. Follow with [`Self::mark_saved_file`] once it returns.
+    pub fn save_in_place(&self, id: DocId, path: &str) -> Result<(), EditError> {
+        let check = |staged: &std::path::Path| self.check_saved_file(id, &staged.to_string_lossy()).map_err(|e| std::io::Error::other(e.to_string()));
+        self.save_in_place_checking(id, path, &check)
+    }
+
+    /// [`Self::save_in_place`], with the completed staging file given to `check` before it
+    /// replaces the target (#1698): the save checks that the file it is about to publish
+    /// re-opens, and a test can refuse at that last step.
+    pub(crate) fn save_in_place_checking(
+        &self,
+        id: DocId,
+        path: &str,
+        check: &dyn Fn(&std::path::Path) -> std::io::Result<()>,
+    ) -> Result<(), EditError> {
+        let path = std::path::Path::new(path);
+        match self.save_plan(id)? {
+            SavePlan::Unchanged(bytes) => {
+                // The file at `path` is these bytes already, unless it was never written there;
+                // the length says which, as the in-place writer's own check does.
+                if std::fs::metadata(path).is_ok_and(|m| m.len() == u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
+                    return Ok(());
+                }
+                guard(|| pdfcraft_cos::save_bytes_in_place(&bytes, path)).map_err(EditError::Write)?.map_err(|e| EditError::Write(e.to_string()))
+            }
+            SavePlan::Write(cos, opts) => guard(|| pdfcraft_cos::save_in_place_checking(&cos, &opts, path, check))
+                .map_err(EditError::Write)?
+                .map_err(|e| EditError::Write(e.to_string())),
+        }
+    }
+
     /// Check that `bytes`, from [`Self::save_bytes`] or [`Self::save_full_bytes`], reopen as this
     /// document before they are written (#1698): [`Self::mark_saved`] only finds out after the
     /// file has been replaced. Same error as `mark_saved`.
@@ -59,6 +141,17 @@ impl Session {
         let Some(editor) = doc.editor.as_ref() else { return Ok(()) };
         pdfcraft_cos::Document::open_with_password(bytes.clone(), editor.keys.reopen.as_deref()).map_err(|e| EditError::Reopen(e.to_string()))?;
         pdfcraft_render::check_pages(bytes.clone(), doc.password.as_deref(), doc.info.pages.len()).map_err(|e| EditError::Reopen(e.to_string()))
+    }
+
+    /// [`Self::check_save`] for a file on disk: a save that streamed to the disk (#55) never
+    /// built its bytes in memory, so the staged file is re-opened from its path — before it
+    /// replaces anything, as `check_save` runs before the write.
+    pub fn check_saved_file(&self, id: DocId, path: &str) -> Result<(), EditError> {
+        let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        let Some(editor) = doc.editor.as_ref() else { return Ok(()) };
+        let bytes = Arc::new(std::fs::read(path).map_err(|e| EditError::Reopen(e.to_string()))?);
+        pdfcraft_cos::Document::open_with_password(bytes.clone(), editor.keys.reopen.as_deref()).map_err(|e| EditError::Reopen(e.to_string()))?;
+        pdfcraft_render::check_pages(bytes, doc.password.as_deref(), doc.info.pages.len()).map_err(|e| EditError::Reopen(e.to_string()))
     }
 
     /// Record a successful save of `bytes` (to `path`, if any): rebase editing on the saved file
@@ -89,6 +182,14 @@ impl Session {
         doc.dirty = false;
         doc.generation += 1;
         Self::refresh(doc).inspect_err(|_| Self::show_released(doc))
+    }
+
+    /// [`Session::mark_saved`] with the saved file read back from `path` (#55): a save that
+    /// streamed to the disk never built its bytes in memory, so the file is where they live.
+    /// The bytes it had held as the working file are replaced by these, not joined to them.
+    pub fn mark_saved_file(&mut self, id: DocId, path: &str) -> Result<(), EditError> {
+        let bytes = Arc::new(std::fs::read(path).map_err(|e| EditError::Reopen(e.to_string()))?);
+        self.mark_saved(id, bytes, Some(path.to_string()))
     }
 
     /// Enter the permissions (owner) password of a document opened with its user password,

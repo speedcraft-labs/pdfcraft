@@ -151,6 +151,22 @@ pub fn write_atomically_with(
     sync_all: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
+    stage_atomically_with(path, form, suffixes, sync_all, &mut |file| file.write_all(bytes), &|_| Ok(()))
+}
+
+/// [`write_atomically_with`], with the staging file filled by `write` instead of a buffer — a
+/// save streamed to the file it belongs to as it is built, without holding the document in
+/// memory a second time (#55) — and the completed staging file given to `check` before it
+/// replaces the target (#1698): a save that would not re-open never reaches the disk. A write,
+/// check or flush that fails removes the staging file and leaves the target as it was.
+pub fn stage_atomically_with(
+    path: &Path,
+    form: StagingName,
+    suffixes: impl IntoIterator<Item = u64>,
+    sync_all: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    write: &mut dyn FnMut(&mut std::fs::File) -> std::io::Result<()>,
+    check: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     // A read-only file is not replaced. Windows refuses the rename anyway, but on Unix a rename
     // ignores the target's permissions: the file would be overwritten without a word, and come
     // out writable (#2658).
@@ -176,7 +192,7 @@ pub fn write_atomically_with(
         // Closed at the end of the block, before the rename (required on Windows).
         {
             let mut file = file;
-            file.write_all(bytes)?;
+            write(&mut file)?;
             #[cfg(target_os = "macos")]
             preserve_target_xattrs(path, &file).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("could not preserve the file's extended attributes; save a copy with Save As: {e}"))
@@ -185,6 +201,9 @@ pub fn write_atomically_with(
             keep_created(&file, created);
             sync_staged(&file, sync_all)?;
         }
+        // The staging file is complete and durable: the caller's last look at it before it
+        // replaces the target.
+        check(&tmp)?;
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {

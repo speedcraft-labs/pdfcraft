@@ -62,3 +62,5 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 pdfcraft-testkit = { workspace = true }
 # JBIG2 fixtures (`encode_jbig2_generic`).
 pdfcraft-filters = { workspace = true }
+# An independent reader for save round-trips: every revision of a saved file must open there too.
+hayro-syntax = { workspace = true }

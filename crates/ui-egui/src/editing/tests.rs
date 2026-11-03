@@ -364,6 +364,29 @@ fn save_commits_the_open_text_box() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Saving a document that lives in a file of its own appends to that file in place (#55): the
+/// original bytes stay first, the working bytes become the file, and nothing is staged beside it.
+#[test]
+fn an_in_place_save_appends_to_the_documents_own_file() {
+    let dir = staging_dir("in-place");
+    let path = dir.join("doc.pdf");
+    let original = one_page_pdf();
+    std::fs::write(&path, &original).unwrap();
+    let mut app = crate::PdfCraftApp::new();
+    app.set_option("language", "en").unwrap();
+    app.open_bytes("doc.pdf", Some(path.to_string_lossy().into_owned()), original.clone()).unwrap();
+    assert!(app.apply_edit(pdfcraft_engine::Edit::RotatePages { pages: vec![0], degrees: 90 }));
+    assert!(app.save_active(SaveTarget::InPlace));
+    let saved = std::fs::read(&path).unwrap();
+    assert!(saved.starts_with(&original), "an in-place save only appends");
+    assert!(saved.len() > original.len(), "the edit is in the file");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no staging file is left behind");
+    let id = app.views[0].id;
+    assert!(!app.session.get(id).unwrap().dirty, "the saved document is clean");
+    assert_eq!(app.session.get(id).unwrap().bytes.as_slice(), saved.as_slice(), "the file is the working bytes");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn save_asks_where_to_keep_an_email_attachment_and_leaves_the_temporary_copy_alone() {
     let dir = staging_dir("mail-temp");

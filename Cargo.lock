@@ -4394,6 +4394,7 @@ dependencies = [
  "chrono",
  "craft-docpath",
  "getrandom 0.4.3",
+ "hayro-syntax",
  "icu_properties",
  "idna",
  "image",
