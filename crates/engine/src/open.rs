@@ -187,6 +187,8 @@ impl Session {
                             page_count: pages,
                             out: &mut script_output,
                             datasets: None,
+                            changed_fields: Default::default(),
+                            structure_changed: false,
                             ran_away: false,
                             time_scale: context.xfa_time_scale,
                         };

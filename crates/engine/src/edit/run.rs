@@ -165,6 +165,8 @@ pub(crate) struct EditCtx {
     /// its scripts produced.
     pub(crate) xfa: Option<Arc<pdfcraft_xfa::model::Template>>,
     pub(crate) xfa_out: js::JsOutput,
+    /// XFA field values changed while handling this edit, for a precise cached form refresh.
+    pub(crate) xfa_changed_fields: std::collections::BTreeSet<String>,
     /// The datasets stream this edit wrote (later writes in the edit replace it in place).
     pub(crate) xfa_datasets: Option<pdfcraft_cos::ObjRef>,
     /// A form script ran too long and was abandoned: the document's scripts go off.
@@ -205,6 +207,7 @@ impl EditCtx {
             js: None,
             xfa: None,
             xfa_out: Default::default(),
+            xfa_changed_fields: Default::default(),
             xfa_datasets: None,
             xfa_ran_away: false,
             xfa_time_scale: 1,
@@ -601,8 +604,15 @@ pub(crate) fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut E
         },
         Edit::XfaEvent { som, activity } => {
             let tpl = cx.xfa.clone().ok_or_else(|| EditError::Invalid("this is not a laid-out XFA form, or JavaScript is off".into()))?;
-            let mut run =
-                xfa::XfaRun { page_count: cx.pages, out: &mut cx.xfa_out, datasets: cx.xfa_datasets, ran_away: false, time_scale: cx.xfa_time_scale };
+            let mut run = xfa::XfaRun {
+                page_count: cx.pages,
+                out: &mut cx.xfa_out,
+                datasets: cx.xfa_datasets,
+                changed_fields: Default::default(),
+                structure_changed: false,
+                ran_away: false,
+                time_scale: cx.xfa_time_scale,
+            };
             let ran = xfa::on_event(doc, &tpl, som, activity, &mut run);
             cx.xfa_datasets = run.datasets;
             cx.xfa_ran_away |= run.ran_away;

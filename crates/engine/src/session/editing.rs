@@ -32,16 +32,36 @@ fn try_indexed_field_edit(
     form: &[pdfcraft_forms::Field],
     edit: &Edit,
     scripts: Option<&mut js::JsRunner>,
+    xfa: Option<&pdfcraft_xfa::model::Template>,
 ) -> Result<bool, EditError> {
     let Edit::SetFieldValue { name, value } = edit else {
         return Ok(false);
     };
-    let result = match scripts {
+    let mut scripts = scripts;
+    let result = match scripts.as_deref_mut() {
         Some(scripts) => guard(|| pdfcraft_forms::set_value_with_fields(next, form, name, value, scripts)),
         None => guard(|| pdfcraft_forms::set_value_with_fields(next, form, name, value, &mut pdfcraft_forms::NoScripts)),
     };
     match result {
         Ok(Ok(())) => Ok(true),
+        Ok(Err(refused @ pdfcraft_forms::FormError::Format(_))) => {
+            let Some(typed) = xfa.and_then(|template| xfa::typed_date(next, Some(template), name, value)) else {
+                return Err(refused.into());
+            };
+            // The failed format attempt can update `/V` before drawing returns its error. The
+            // general setter rereads the form for the typed-date retry; keep the indexed path in
+            // step with it instead of reusing the pre-attempt snapshot.
+            let retry_fields = pdfcraft_forms::fields(next);
+            let retry = match scripts.as_deref_mut() {
+                Some(scripts) => guard(|| pdfcraft_forms::set_value_with_fields(next, &retry_fields, name, &typed, scripts)),
+                None => guard(|| pdfcraft_forms::set_value_with_fields(next, &retry_fields, name, &typed, &mut pdfcraft_forms::NoScripts)),
+            };
+            match retry {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(error)) => Err(error.into()),
+                Err(message) => Err(EditError::Invalid(format!("{} failed unexpectedly ({message}); the document was not changed", edit.label()))),
+            }
+        }
         Ok(Err(error)) => Err(error.into()),
         Err(message) => Err(EditError::Invalid(format!("{} failed unexpectedly ({message}); the document was not changed", edit.label()))),
     }
@@ -108,10 +128,16 @@ impl Session {
                     || field.actions.scripts.calculate.is_some()
             });
             if actionful {
-                if !js_off && uses_scripts(&edit) {
-                    cx.js = Some(js::JsRunner::new(&next, &name));
+                // XFA's date-pattern retry must use the complete setter and rebuild its field
+                // snapshot after a format refusal. Keep that specialized path on the slow setter.
+                if doc.info.xfa.is_some() {
+                    false
+                } else {
+                    if !js_off && uses_scripts(&edit) {
+                        cx.js = Some(js::JsRunner::new(&next, &name));
+                    }
+                    try_indexed_field_edit(&mut next, &doc.form, &edit, cx.js.as_mut(), cx.xfa.as_deref())?
                 }
-                try_indexed_field_edit(&mut next, &doc.form, &edit, cx.js.as_mut())?
             } else {
                 simple_field_applied = try_simple_field_edit(&mut next, &doc.form, &edit)?;
                 simple_field_applied
@@ -189,6 +215,8 @@ impl Session {
                     page_count: cx.pages,
                     out: &mut cx.xfa_out,
                     datasets: cx.xfa_datasets,
+                    changed_fields: Default::default(),
+                    structure_changed: false,
                     ran_away: false,
                     time_scale: cx.xfa_time_scale,
                 };
@@ -197,6 +225,10 @@ impl Session {
                 let ran = guard(|| xfa::on_changes(&mut next, &tpl, &changed, &mut run))
                     .unwrap_or_else(|m| Err(format!("the form's scripts failed unexpectedly ({m})")));
                 cx.xfa_datasets = run.datasets;
+                cx.xfa_changed_fields.extend(std::mem::take(&mut run.changed_fields));
+                if run.structure_changed {
+                    scope = Scope::Full;
+                }
                 cx.xfa_ran_away |= run.ran_away;
                 if let Err(e) = ran {
                     cx.xfa_out.errors.push(e);
@@ -249,7 +281,7 @@ impl Session {
             if scope == Scope::Content {
                 Self::refresh_content(doc, Some(&edit))
             } else {
-                Self::refresh_scoped(doc, scope, Some(&edit), simple_field_applied)
+                Self::refresh_scoped(doc, scope, Some(&edit), simple_field_applied, &cx.xfa_changed_fields)
             }
         })
         .unwrap_or_else(|m| Err(EditError::Reopen(m)));
@@ -299,7 +331,7 @@ impl Session {
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.redo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false, &Default::default())).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.redo.pop()
@@ -328,7 +360,7 @@ impl Session {
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.undo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false, &Default::default())).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.undo.pop()
@@ -368,7 +400,14 @@ impl Session {
     /// keep the renderer; other scopes also replace it.
     /// Comment and form edits skip the full re-inspection (seconds on very large files): the
     /// comment list and field values are re-read from the object graph instead.
-    fn refresh_scoped(doc: &mut Document, scope: Scope, edit: Option<&Edit>, simple_field_applied: bool) -> Result<(), EditError> {
+    fn refresh_scoped(
+        doc: &mut Document,
+        scope: Scope,
+        edit: Option<&Edit>,
+        simple_field_applied: bool,
+        xfa_changed_fields: &std::collections::BTreeSet<String>,
+    ) -> Result<(), EditError> {
+        let known_xfa_fields = (simple_field_applied && doc.info.xfa.is_some()).then_some(xfa_changed_fields);
         if scope == Scope::Form
             && let Some(edit) = edit
             && simple_field_applied
@@ -378,7 +417,7 @@ impl Session {
         }
         if scope == Scope::Form
             && let Some(edit) = edit
-            && Self::refresh_field_edit(doc, edit)?
+            && Self::refresh_field_edit(doc, edit, known_xfa_fields)?
         {
             return Ok(());
         }
@@ -544,7 +583,11 @@ impl Session {
 
     /// A field edit changes a small part of the form. Keep the existing display revision and
     /// replace the appearances for fields whose values changed, including calculation results.
-    fn refresh_field_edit(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
+    fn refresh_field_edit(
+        doc: &mut Document,
+        edit: &Edit,
+        xfa_changed_fields: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<bool, EditError> {
         let Edit::SetFieldValue { name, .. } = edit else { return Ok(false) };
         if doc.info.encrypted || !doc.signatures.is_empty() {
             return Ok(false);
@@ -556,6 +599,9 @@ impl Session {
         {
             let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
             for (index, field) in Arc::make_mut(&mut doc.form).iter_mut().enumerate() {
+                if xfa_changed_fields.is_some_and(|names| field.name != *name && !names.contains(&field.name)) {
+                    continue;
+                }
                 let old_value = field.value.clone();
                 let old_flags = field.flags;
                 let old_widgets: Vec<_> = field
@@ -581,7 +627,19 @@ impl Session {
                 }
             }
         }
-        if !changed_indices.iter().any(|&index| doc.form[index].name == *name) {
+        if changed_indices.is_empty() && xfa_changed_fields.is_some() {
+            Self::release_working(doc);
+            let Some(editor) = doc.editor.as_ref() else { return Ok(true) };
+            let bytes = if editor.cos.is_modified() {
+                Arc::new(write_incremental(&editor.cos, &SaveOptions::default()).map_err(|error| EditError::Write(error.to_string()))?)
+            } else {
+                editor.cos.bytes().clone()
+            };
+            doc.info.file_size = bytes.len();
+            doc.bytes = bytes;
+            return Ok(true);
+        }
+        if xfa_changed_fields.is_none() && !changed_indices.iter().any(|&index| doc.form[index].name == *name) {
             return Ok(false);
         }
         let changed: Vec<_> = changed_indices.iter().map(|&index| doc.form[index].clone()).collect();

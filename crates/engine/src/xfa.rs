@@ -126,6 +126,10 @@ pub(crate) struct XfaRun<'a> {
     pub out: &'a mut JsOutput,
     /// The datasets stream this edit already wrote, replaced in place by later writes.
     pub datasets: Option<pdfcraft_cos::ObjRef>,
+    /// AcroForm values written by XFA scripts during this event.
+    pub changed_fields: std::collections::BTreeSet<String>,
+    /// The event changed layout or field visibility, so the caller must rebuild the view.
+    pub structure_changed: bool,
     /// A script ran past its time limit and was abandoned: the form's scripts should stay off.
     pub ran_away: bool,
     /// What every time limit of the scripts is multiplied by (the event's budget, the engine's
@@ -411,6 +415,7 @@ impl<'a, 'b> Runner<'a, 'b> {
     /// Change the data's structure (and the in-memory copy scripts read): the form is rebuilt
     /// for the next script.
     fn data_op(&mut self, op: pdfcraft_xfa::DataOp) {
+        self.run.structure_changed = true;
         self.data.get_or_insert_with(Default::default).apply(&op);
         self.pending.push(op);
         self.invalidate();
@@ -463,6 +468,7 @@ impl<'a, 'b> Runner<'a, 'b> {
             }
             self.fields().insert(name.clone(), updated);
             self.field_changes.insert(name.clone(), new_value);
+            self.run.changed_fields.insert(name.clone());
             changed = true;
         }
         if self.data.as_ref().and_then(|d| d.text_at(&path)).unwrap_or("") != text {
@@ -519,6 +525,7 @@ impl<'a, 'b> Runner<'a, 'b> {
             }
             return Ok(());
         }
+        self.run.structure_changed = true;
         self.relayouts += 1;
         self.flush()?;
         let report = pdfcraft_xfa::rerender(self.doc, self.tpl).map_err(|e| e.to_string())?;
@@ -601,6 +608,7 @@ impl<'a, 'b> Runner<'a, 'b> {
                 XfaEffect::SetPresence { som, presence } => {
                     if self.ov.presence.insert(som.clone(), presence.clone()).as_ref() != Some(presence) {
                         self.ov_dirty = true;
+                        self.run.structure_changed = true;
                         self.changes.visibility += 1;
                         self.invalidate();
                         relayout = true;
@@ -609,6 +617,7 @@ impl<'a, 'b> Runner<'a, 'b> {
                 XfaEffect::SetAccess { som, access } => {
                     if self.ov.access.insert(som.clone(), access.clone()).as_ref() != Some(access) {
                         self.ov_dirty = true;
+                        self.run.structure_changed = true;
                         self.changes.visibility += 1;
                         self.invalidate();
                         relayout = true;
