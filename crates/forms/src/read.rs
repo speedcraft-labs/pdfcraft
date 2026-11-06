@@ -292,20 +292,30 @@ pub fn fields(doc: &Document) -> Vec<Field> {
     fields_with_adopted(doc).items
 }
 
-/// Refresh only the value and widget state of a field already read from this document.
+/// Refresh the value, inherited flags and widget state of a field already read from this document.
 ///
-/// This is for edits that are known not to run field scripts or change field metadata. It avoids
-/// walking the entire field tree and decoding every action just to update one cached value.
+/// This avoids walking the entire field tree and decoding every action just to update values after
+/// an edit. Callers that need action metadata can keep the original field index.
 pub fn current_field_value(doc: &Document, field: &Field) -> Field {
     let mut updated = field.clone();
+    updated.flags = 0;
     let mut current = Some(field.obj);
     let mut seen = std::collections::HashSet::new();
     let mut value = None;
+    let mut found_value = false;
+    let mut found_flags = false;
     while let Some(reference) = current.filter(|r| seen.insert(*r) && seen.len() <= 64) {
         let object = doc.get(reference);
         let Some(dict) = object.as_dict() else { break };
-        if let Some(v) = dict.get(b"V") {
+        if !found_flags && let Some(flags) = field_flags(doc, dict) {
+            updated.flags = flags;
+            found_flags = true;
+        }
+        if !found_value && let Some(v) = dict.get(b"V") {
             value = Some(v.clone());
+            found_value = true;
+        }
+        if found_value && found_flags {
             break;
         }
         current = dict.reference(b"Parent");
@@ -318,7 +328,12 @@ pub fn current_field_value(doc: &Document, field: &Field) -> Field {
     for widget in &mut updated.widgets {
         let object = doc.get(widget.obj);
         let Some(dict) = object.as_dict() else { continue };
+        let annot_flags = dict.get(b"F").and_then(|f| doc.resolve(f).as_int()).unwrap_or(0);
+        let own_flags = if widget.obj == field.obj { 0 } else { field_flags(doc, dict).unwrap_or(0) };
         widget.state = dict.name(b"AS").map(name_text);
+        widget.locked = annot_flags & 128 != 0;
+        widget.hidden = annot_flags & (2 | 32) != 0;
+        widget.read_only = (updated.flags | own_flags) & flags::READ_ONLY != 0;
         if updated.kind == FieldKind::List {
             widget.list = Some(appearance::list_rows_of(doc, &updated.da, field_dict, dict));
         }

@@ -98,7 +98,7 @@ impl Session {
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
         let mut simple_field_applied = false;
-        let fast_field_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
+        let fast_field_applied = if !doc.info.encrypted && doc.signatures.is_empty() && !signed {
             let actionful = doc.form.iter().any(|field| {
                 !field.actions.is_empty()
                     || !field.actions.unsupported.is_empty()
@@ -546,13 +546,13 @@ impl Session {
     /// replace the appearances for fields whose values changed, including calculation results.
     fn refresh_field_edit(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
         let Edit::SetFieldValue { name, .. } = edit else { return Ok(false) };
-        if doc.info.encrypted || doc.info.xfa.is_some() || !doc.signatures.is_empty() {
+        if doc.info.encrypted || !doc.signatures.is_empty() {
             return Ok(false);
         }
         let old_fields = doc.form.clone();
-        let new_fields = {
+        let new_fields: Vec<_> = {
             let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
-            pdfcraft_forms::fields(&editor.cos)
+            old_fields.iter().map(|field| pdfcraft_forms::current_field_value(&editor.cos, field)).collect()
         };
         if old_fields.len() != new_fields.len()
             || doc.info.fields.len() != new_fields.len()

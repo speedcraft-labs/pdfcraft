@@ -3492,6 +3492,19 @@ fn current_field_value_matches_a_full_read_for_nested_buttons_and_choices() {
 }
 
 #[test]
+fn current_field_value_tracks_inherited_and_widget_flags() {
+    let mut doc = fixture();
+    let before = field(&fields(&doc), "address.city").clone();
+    let parent = doc.get(before.obj).as_dict().unwrap().reference(b"Parent").unwrap();
+    doc.update_dict(parent, |dict| dict.set(b"Ff".to_vec(), Object::Int(flags::READ_ONLY as i64))).unwrap();
+    doc.update_dict(before.widgets[0].obj, |dict| dict.set(b"F".to_vec(), Object::Int(128 | 2))).unwrap();
+
+    let targeted = current_field_value(&doc, &before);
+    let complete = field(&fields(&doc), "address.city").clone();
+    assert_eq!(targeted, complete, "targeted flags must match a full form read");
+}
+
+#[test]
 fn indexed_actionful_field_update_matches_the_general_setter_bytes() {
     use crate::af::{CalcOp, Calculate, Format, Validate};
 
