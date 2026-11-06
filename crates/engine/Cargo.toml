@@ -46,6 +46,7 @@ tiff = "0.11"
 url = "2.5"
 idna = "1.1"
 icu_properties = "2.3"
+sha2 = "0.11"
 unicode-segmentation = "1.13"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
