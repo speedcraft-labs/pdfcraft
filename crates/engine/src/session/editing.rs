@@ -489,7 +489,8 @@ impl Session {
             return Ok(false);
         }
 
-        let mut display = if Arc::ptr_eq(&doc.display, &doc.bytes) {
+        let source_revision_display = Arc::ptr_eq(&doc.display, &doc.bytes);
+        let mut display = if source_revision_display {
             let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
             editor.cos.clone()
         } else {
@@ -500,7 +501,12 @@ impl Session {
         };
         {
             let Some(editor) = doc.editor.as_mut() else { return Ok(false) };
-            if !pdfcraft_forms::update_field_display(&editor.cos, &mut display, &updated, &mut editor.field_appearances) {
+            let updated = if source_revision_display {
+                pdfcraft_forms::update_field_display_from_source_revision(&editor.cos, &mut display, &updated, &mut editor.field_appearances)
+            } else {
+                pdfcraft_forms::update_field_display(&editor.cos, &mut display, &updated, &mut editor.field_appearances)
+            };
+            if !updated {
                 return Ok(false);
             }
         }
@@ -579,7 +585,8 @@ impl Session {
         // updated field values. Clone that graph for the display-only appearance changes instead
         // of reparsing the whole PDF on every form edit. Reopen the display copy only when opening
         // the document had to add display-only appearances of its own.
-        let mut display = if Arc::ptr_eq(&doc.display, &doc.bytes) {
+        let source_revision_display = Arc::ptr_eq(&doc.display, &doc.bytes);
+        let mut display = if source_revision_display {
             let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
             editor.cos.clone()
         } else {
@@ -591,7 +598,12 @@ impl Session {
         {
             let Some(editor) = doc.editor.as_mut() else { return Ok(false) };
             for field in &changed {
-                if !pdfcraft_forms::update_field_display(&editor.cos, &mut display, field, &mut editor.field_appearances) {
+                let updated = if source_revision_display {
+                    pdfcraft_forms::update_field_display_from_source_revision(&editor.cos, &mut display, field, &mut editor.field_appearances)
+                } else {
+                    pdfcraft_forms::update_field_display(&editor.cos, &mut display, field, &mut editor.field_appearances)
+                };
+                if !updated {
                     return Ok(false);
                 }
             }

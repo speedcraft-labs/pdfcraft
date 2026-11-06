@@ -149,6 +149,22 @@ pub fn update_simple_text_field_display(source: &Document, display: &mut Documen
 /// fields. It refuses references to newly edited source objects, leaving the caller to rebuild
 /// the display copy so that action-created resources cannot be missed.
 pub fn update_field_display(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
+    update_field_display_impl(source, display, field, cache, false)
+}
+
+/// Update the display when it was cloned from the edited source revision. References to objects
+/// edited in that revision are valid in both graphs, so they can stay in the generated appearance.
+pub fn update_field_display_from_source_revision(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
+    update_field_display_impl(source, display, field, cache, true)
+}
+
+fn update_field_display_impl(
+    source: &Document,
+    display: &mut Document,
+    field: &Field,
+    cache: &mut FieldAppearanceCache,
+    same_revision: bool,
+) -> bool {
     if field.widgets.is_empty() {
         return false;
     }
@@ -156,7 +172,7 @@ pub fn update_field_display(source: &Document, display: &mut Document, field: &F
     let Some(field_dict) = source_field.as_dict() else { return false };
     let value_keys: [&[u8]; 3] = [b"V", b"I", b"RV"];
     let values: Vec<(&[u8], Object)> = value_keys.iter().filter_map(|key| field_dict.get(key).cloned().map(|value| (*key, value))).collect();
-    if values.iter().any(|(_, value)| has_edited_reference(source, value)) {
+    if !same_revision && values.iter().any(|(_, value)| has_edited_reference(source, value)) {
         return false;
     }
 
@@ -174,7 +190,7 @@ pub fn update_field_display(source: &Document, display: &mut Document, field: &F
             FieldKind::CheckBox | FieldKind::Radio => appearance::button_state_shown(display, field, widget, state.as_deref() != Some("Off")),
             _ => appearance::field_appearance_drawn(display, field, widget, &field.value, true).0,
         };
-        if stream.dict.iter().any(|(_, value)| has_edited_reference(display, value)) {
+        if !same_revision && stream.dict.iter().any(|(_, value)| has_edited_reference(display, value)) {
             return false;
         }
         cache.insert(widget.obj, appearance_inputs(source, widget), &stream);
