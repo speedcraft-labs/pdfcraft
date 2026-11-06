@@ -24,6 +24,37 @@ pub fn set_value_with(doc: &mut Document, name: &str, value: &FieldValue, script
     Ok(())
 }
 
+/// Set one unambiguous, actionless root text field using fields the caller already read.
+/// `Ok(false)` means the field does not meet these conditions and the general setter should run.
+/// No calculations need recalculation: this function checks that every field has no actions.
+pub fn set_simple_text_value(doc: &mut Document, all: &[Field], name: &str, value: &str) -> Result<bool, FormError> {
+    let mut named = all.iter().filter(|field| field.name == name);
+    let Some(field) = named.next() else { return Ok(false) };
+    if named.next().is_some()
+        || field.kind != FieldKind::Text
+        || field.widgets.len() != 1
+        || field.widgets[0].obj != field.obj
+        || doc.get(field.obj).as_dict().is_none_or(|dict| dict.reference(b"Parent").is_some())
+        || all.iter().any(|field| {
+            !field.actions.is_empty()
+                || !field.actions.unsupported.is_empty()
+                || field.actions.scripts.format.is_some()
+                || field.actions.scripts.keystroke.is_some()
+                || field.actions.scripts.validate.is_some()
+                || field.actions.scripts.calculate.is_some()
+        })
+    {
+        return Ok(false);
+    }
+    if field.read_only() {
+        return Err(FormError::ReadOnly(name.into()));
+    }
+    let mut scripts = NoScripts;
+    write_value(doc, field, &FieldValue::Text(value.into()), &mut scripts)?;
+    author::form_fonts_as_objects(doc, all)?;
+    Ok(true)
+}
+
 /// Fill several fields, as [`set_value`] fills each in turn, but reading the form once and
 /// recalculating once, after the last value. Filling fields one by one reads the whole form twice
 /// per field, which takes minutes on a form with thousands of fields.

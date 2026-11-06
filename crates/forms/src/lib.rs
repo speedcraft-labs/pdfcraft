@@ -56,7 +56,7 @@ use values::write_value;
 pub(crate) use values::{ask_viewers_to_redraw, merged_appearance};
 pub use values::{
     calculations_changed, clear_password_values, has_password_values, password_values, recalculate, recalculate_with, reset, restore_password_values,
-    set_value, set_value_with, set_values,
+    set_simple_text_value, set_value, set_value_with, set_values,
 };
 
 #[cfg(test)]

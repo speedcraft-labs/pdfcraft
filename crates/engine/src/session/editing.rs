@@ -64,14 +64,34 @@ impl Session {
             return Ok(());
         }
         let mut next = editor.cos.clone();
-        if !js_off && uses_scripts(&edit) {
-            cx.js = Some(js::JsRunner::new(&next, &name));
-        }
         cx.renamed_fields.clear();
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
-        guard(|| run_edit(&mut next, &edit, &mut cx))
-            .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+        let simple_text_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
+            match &edit {
+                Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } => {
+                    match guard(|| pdfcraft_forms::set_simple_text_value(&mut next, &doc.form, name, value)) {
+                        Ok(result) => result?,
+                        Err(message) => {
+                            return Err(EditError::Invalid(format!(
+                                "{} failed unexpectedly ({message}); the document was not changed",
+                                edit.label()
+                            )));
+                        }
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if !simple_text_applied && !js_off && uses_scripts(&edit) {
+            cx.js = Some(js::JsRunner::new(&next, &name));
+        }
+        if !simple_text_applied {
+            guard(|| run_edit(&mut next, &edit, &mut cx))
+                .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+        }
         // Redaction removed what its own interpreter places under the marks. The marks were drawn
         // over the page as the renderer shows it, so the renderer has the last word.
         if let Edit::ApplyRedactions { pages } = &edit {

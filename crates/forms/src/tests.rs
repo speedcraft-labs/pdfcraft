@@ -3432,6 +3432,16 @@ fn a_text_field_display_update_reuses_the_other_widgets() {
     assert_eq!(ap(&display, &field(&fields(&display), "a").widgets[0]), old_a);
 }
 
+#[test]
+fn simple_text_field_update_matches_the_general_setter_bytes() {
+    let mut simple = fixture();
+    let mut general = fixture();
+    let all = fields(&simple);
+    assert!(set_simple_text_value(&mut simple, &all, "name", "Grace").unwrap());
+    set_value(&mut general, "name", &FieldValue::Text("Grace".into())).unwrap();
+    assert_eq!(write_incremental(&simple, &SaveOptions::default()).unwrap(), write_incremental(&general, &SaveOptions::default()).unwrap());
+}
+
 /// #3470: each kind of input a field's drawing depends on invalidates its cached appearance when
 /// it changes, wherever it lives: the parent field's value, the form's `/DA`, an indirect `/MK`
 /// and a `/DR` font. Field H is a parent with one kid widget; I is a plain field.
