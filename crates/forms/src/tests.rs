@@ -3426,7 +3426,7 @@ fn a_text_field_display_update_reuses_the_other_widgets() {
     set_value(&mut source, "b", &FieldValue::Text("Typed".into())).unwrap();
     let source_fields = fields(&source);
     let changed = field(&source_fields, "b");
-    assert!(update_simple_text_field_display(&source, &mut display, &changed, &mut cache));
+    assert!(update_simple_text_field_display(&source, &mut display, changed, &mut cache));
 
     assert!(ap(&display, &field(&fields(&display), "b").widgets[0]).contains("(Typed) Tj"));
     assert_eq!(ap(&display, &field(&fields(&display), "a").widgets[0]), old_a);

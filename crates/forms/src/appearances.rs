@@ -119,8 +119,10 @@ pub fn update_simple_text_field_display(source: &Document, display: &mut Documen
     if value.as_ref().is_some_and(|value| has_edited_reference(source, value)) {
         return false;
     }
-    let stream = appearance::field_appearance_drawn(source, field, widget, &field.value, true).0;
-    if stream.dict.iter().any(|(_, value)| has_edited_reference(source, value)) {
+    // The display revision is the snapshot that will receive this appearance. Drawing against
+    // it keeps its resource references valid even when the editable source has a newer /DR.
+    let stream = appearance::field_appearance_drawn(display, field, widget, &field.value, true).0;
+    if stream.dict.iter().any(|(_, value)| has_edited_reference(display, value)) {
         return false;
     }
     cache.insert(widget.obj, appearance_inputs(source, widget), &stream);

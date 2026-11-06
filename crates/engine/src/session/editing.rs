@@ -409,25 +409,31 @@ impl Session {
         if doc.info.encrypted || doc.info.xfa.is_some() || !doc.signatures.is_empty() {
             return Ok(false);
         }
-        let fields = doc.form.clone();
-        if fields.iter().any(|field| {
-            !field.actions.is_empty()
-                || !field.actions.unsupported.is_empty()
-                || field.actions.scripts.format.is_some()
-                || field.actions.scripts.keystroke.is_some()
-                || field.actions.scripts.validate.is_some()
-                || field.actions.scripts.calculate.is_some()
-        }) {
-            return Ok(false);
-        }
-        let mut matching = fields.iter().filter(|field| field.name == *name);
-        let Some(field) = matching.next() else { return Ok(false) };
-        if matching.next().is_some() || field.kind != pdfcraft_forms::FieldKind::Text || field.widgets.len() != 1 || field.widgets[0].obj != field.obj
-        {
-            return Ok(false);
-        }
-        let mut updated_field = field.clone();
-        updated_field.value = if value.is_empty() { Vec::new() } else { vec![value.clone()] };
+        let updated_field = {
+            let fields = doc.form.as_ref();
+            if fields.iter().any(|field| {
+                !field.actions.is_empty()
+                    || !field.actions.unsupported.is_empty()
+                    || field.actions.scripts.format.is_some()
+                    || field.actions.scripts.keystroke.is_some()
+                    || field.actions.scripts.validate.is_some()
+                    || field.actions.scripts.calculate.is_some()
+            }) {
+                return Ok(false);
+            }
+            let mut matching = fields.iter().filter(|field| field.name == *name);
+            let Some(field) = matching.next() else { return Ok(false) };
+            if matching.next().is_some()
+                || field.kind != pdfcraft_forms::FieldKind::Text
+                || field.widgets.len() != 1
+                || field.widgets[0].obj != field.obj
+            {
+                return Ok(false);
+            }
+            let mut updated_field = field.clone();
+            updated_field.value = if value.is_empty() { Vec::new() } else { vec![value.clone()] };
+            updated_field
+        };
 
         let old_display = doc.display.clone();
         let mut display = match pdfcraft_cos::Document::open_with_password(old_display, doc.password.as_deref()) {
