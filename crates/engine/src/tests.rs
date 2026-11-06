@@ -2846,6 +2846,14 @@ fn filling_a_form_shows_saves_and_undoes() {
     assert_eq!(d.form[0].value, ["Ada Lovelace"]);
     assert_eq!(d.form[1].value, ["Yes"]);
     assert_eq!(page_texts(&s, id), ["Ada Lovelace"], "the new appearance shows the text");
+    let display = pdfcraft_cos::Document::open(d.display.clone()).unwrap();
+    let ok_widget = d.form.iter().find(|field| field.name == "ok").unwrap().widgets[0].obj;
+    let widget_object = display.get(ok_widget);
+    let widget = widget_object.as_dict().unwrap();
+    assert_eq!(widget.name(b"AS"), Some(&b"Yes"[..]), "the display copy tracks the checked state");
+    let appearances = display.resolve(widget.get(b"AP").unwrap());
+    let normal = display.resolve(appearances.as_dict().unwrap().get(b"N").unwrap());
+    assert!(normal.as_dict().unwrap().contains(b"Yes"), "the display copy has the checked appearance state");
     let err = s.apply(id, Edit::SetFieldValue { name: "missing".into(), value: FieldValue::Text("x".into()) }).unwrap_err();
     assert_eq!(err.to_string(), "there is no field named \"missing\"");
     s.apply(id, Edit::ResetForm { names: None }).unwrap();
@@ -9229,6 +9237,26 @@ fn dynamic_calculation_reads_and_side_effects_reach_later_fields() {
     assert!(field("field6").read_only(), "side-effect property applied");
     assert_eq!(field("field7").value, ["ranks"]);
     assert!(s.take_js_output(id).errors.is_empty());
+}
+
+#[test]
+fn indexed_javascript_field_edit_matches_the_general_setter_bytes() {
+    let base = pdfcraft_cos::Document::open(Arc::new(synthetic_acroform(8, 4))).unwrap();
+    let fields = pdfcraft_forms::fields(&base);
+    let mut indexed = base.clone();
+    let mut general = base;
+    let mut indexed_scripts = js::JsRunner::new(&indexed, "dynamic.pdf");
+    let mut general_scripts = js::JsRunner::new(&general, "dynamic.pdf");
+    let value = FieldValue::Text("4".into());
+
+    pdfcraft_forms::set_value_with_fields(&mut indexed, &fields, "ranks", &value, &mut indexed_scripts).unwrap();
+    pdfcraft_forms::set_value_with(&mut general, "ranks", &value, &mut general_scripts).unwrap();
+
+    assert_eq!(
+        pdfcraft_cos::write_incremental(&indexed, &Default::default()).unwrap(),
+        pdfcraft_cos::write_incremental(&general, &Default::default()).unwrap(),
+        "the indexed route must preserve JavaScript calculations and side effects byte-for-byte"
+    );
 }
 
 #[test]

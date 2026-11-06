@@ -144,6 +144,80 @@ pub fn update_simple_text_field_display(source: &Document, display: &mut Documen
         .is_ok()
 }
 
+/// Copy the new value and appearances of a changed terminal field into an existing display
+/// revision. This handles hierarchical fields, fields with several widgets, and button/choice
+/// fields. It refuses references to newly edited source objects, leaving the caller to rebuild
+/// the display copy so that action-created resources cannot be missed.
+pub fn update_field_display(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
+    if field.widgets.is_empty() {
+        return false;
+    }
+    let source_field = source.get(field.obj);
+    let Some(field_dict) = source_field.as_dict() else { return false };
+    let value_keys: [&[u8]; 3] = [b"V", b"I", b"RV"];
+    let values: Vec<(&[u8], Object)> = value_keys.iter().filter_map(|key| field_dict.get(key).cloned().map(|value| (*key, value))).collect();
+    if values.iter().any(|(_, value)| has_edited_reference(source, value)) {
+        return false;
+    }
+
+    let mut updates = Vec::with_capacity(field.widgets.len());
+    for widget in &field.widgets {
+        let state = match field.kind {
+            FieldKind::CheckBox | FieldKind::Radio => {
+                let mine = |value: &&String| widget.on_state.as_ref().map_or(field.kind == FieldKind::CheckBox, |on| on == *value);
+                let value = field.value.first().filter(|value| !value.is_empty() && value.as_str() != "Off").filter(mine);
+                Some(widget.state.clone().or_else(|| value.cloned()).unwrap_or_else(|| "Off".into()))
+            }
+            _ => None,
+        };
+        let stream = match field.kind {
+            FieldKind::CheckBox | FieldKind::Radio => appearance::button_state_shown(display, field, widget, state.as_deref() != Some("Off")),
+            _ => appearance::field_appearance_drawn(display, field, widget, &field.value, true).0,
+        };
+        if stream.dict.iter().any(|(_, value)| has_edited_reference(display, value)) {
+            return false;
+        }
+        cache.insert(widget.obj, appearance_inputs(source, widget), &stream);
+        let appearance = display.add(Object::Stream(stream));
+        let mut fresh = Dict::new();
+        if let Some(state) = state.as_deref() {
+            let mut states = Dict::new();
+            states.set(name_bytes(state), Object::Ref(appearance));
+            fresh.set(b"N".to_vec(), Object::Dict(states));
+        } else {
+            fresh.set(b"N".to_vec(), Object::Ref(appearance));
+        }
+        let ap = merged_appearance(display, widget.obj, &fresh);
+        updates.push((widget.obj, state, ap));
+    }
+
+    for (widget, state, ap) in updates {
+        if display
+            .update_dict(widget, |dict| {
+                dict.set(b"AP".to_vec(), Object::Dict(ap));
+                if let Some(state) = state {
+                    dict.set(b"AS".to_vec(), Object::Name(name_bytes(&state)));
+                }
+            })
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    display
+        .update_dict(field.obj, |dict| {
+            for key in value_keys {
+                if let Some((_, value)) = values.iter().find(|(candidate, _)| *candidate == key) {
+                    dict.set(key.to_vec(), value.clone());
+                } else {
+                    dict.remove(key);
+                }
+            }
+        })
+        .is_ok()
+}
+
 fn has_edited_reference(doc: &Document, object: &Object) -> bool {
     match object {
         Object::Ref(r) => doc.is_edited(r.num),

@@ -3442,6 +3442,77 @@ fn simple_text_field_update_matches_the_general_setter_bytes() {
     assert_eq!(write_incremental(&simple, &SaveOptions::default()).unwrap(), write_incremental(&general, &SaveOptions::default()).unwrap());
 }
 
+#[test]
+fn simple_field_update_matches_the_general_setter_for_hierarchy_buttons_and_choices() {
+    for (name, value) in [
+        ("address.city", FieldValue::Text("London".into())),
+        ("agree", FieldValue::Check(true)),
+        ("size", FieldValue::Radio(Some("L".into()))),
+        ("country", FieldValue::Choice(vec!["fr".into()])),
+    ] {
+        let mut simple = fixture();
+        let mut general = fixture();
+        let all = fields(&simple);
+        assert!(set_simple_field_value(&mut simple, &all, name, &value).unwrap(), "{name}");
+        set_value(&mut general, name, &value).unwrap();
+        assert_eq!(
+            write_incremental(&simple, &SaveOptions::default()).unwrap(),
+            write_incremental(&general, &SaveOptions::default()).unwrap(),
+            "{name} fast path must match the general setter byte-for-byte"
+        );
+    }
+
+    let mut simple = dotted_form();
+    let mut general = dotted_form();
+    let all = fields(&simple);
+    let value = FieldValue::Text("shared widgets".into());
+    assert!(set_simple_field_value(&mut simple, &all, "MASTER.e", &value).unwrap());
+    set_value(&mut general, "MASTER.e", &value).unwrap();
+    assert_eq!(write_incremental(&simple, &SaveOptions::default()).unwrap(), write_incremental(&general, &SaveOptions::default()).unwrap());
+}
+
+#[test]
+fn indexed_actionful_field_update_matches_the_general_setter_bytes() {
+    use crate::af::{CalcOp, Calculate, Format, Validate};
+
+    let mut base = one_page();
+    let text = NewField::Text { multiline: false };
+    for (name, y) in [("amount", 700.0), ("qty", 660.0), ("total", 620.0)] {
+        add_field(&mut base, 0, [50.0, y, 250.0, y + 20.0], &text, Some(name)).unwrap();
+    }
+    set_props(
+        &mut base,
+        "amount",
+        &FieldProps {
+            format: Some(Format::Number { decimals: 2, sep: 0, neg: 0, currency: String::new(), prepend: false }),
+            validate: Some(Validate::Range { min: Some(0.0), max: None }),
+            ..FieldProps::default()
+        },
+    )
+    .unwrap();
+    set_props(
+        &mut base,
+        "total",
+        &FieldProps {
+            calculate: Some(Calculate::Simple { op: CalcOp::Product, fields: vec!["amount".into(), "qty".into()] }),
+            ..FieldProps::default()
+        },
+    )
+    .unwrap();
+
+    let mut indexed = base.clone();
+    let mut general = base;
+    let all = fields(&indexed);
+    set_value_with_fields(&mut indexed, &all, "amount", &FieldValue::Text("3.5".into()), &mut NoScripts).unwrap();
+    set_value(&mut general, "amount", &FieldValue::Text("3.5".into())).unwrap();
+    assert_eq!(
+        write_incremental(&indexed, &SaveOptions::default()).unwrap(),
+        write_incremental(&general, &SaveOptions::default()).unwrap(),
+        "the indexed path must keep validation, formatting and calculations byte-identical"
+    );
+    assert_eq!(field(&fields(&indexed), "amount").value, ["3.5"]);
+}
+
 /// #3470: each kind of input a field's drawing depends on invalidates its cached appearance when
 /// it changes, wherever it lives: the parent field's value, the form's `/DA`, an indirect `/MK`
 /// and a `/DR` font. Field H is a parent with one kid widget; I is a plain field.

@@ -41,8 +41,8 @@ mod tab_order;
 mod values;
 
 pub use appearances::{
-    FieldAppearanceCache, declares_pdfa, need_appearances, undrawn_fields, update_simple_text_field_display, with_field_appearances,
-    with_field_appearances_cached,
+    FieldAppearanceCache, declares_pdfa, need_appearances, undrawn_fields, update_field_display, update_simple_text_field_display,
+    with_field_appearances, with_field_appearances_cached,
 };
 pub(crate) use read::page_refs;
 pub use read::{Fields, acroform, adopted_page_fields, fields, fields_with_adopted};
@@ -56,7 +56,7 @@ use values::write_value;
 pub(crate) use values::{ask_viewers_to_redraw, merged_appearance};
 pub use values::{
     calculations_changed, clear_password_values, has_password_values, password_values, recalculate, recalculate_with, reset, restore_password_values,
-    set_simple_text_value, set_value, set_value_with, set_values,
+    set_simple_field_value, set_simple_text_value, set_value, set_value_with, set_value_with_fields, set_values,
 };
 
 #[cfg(test)]

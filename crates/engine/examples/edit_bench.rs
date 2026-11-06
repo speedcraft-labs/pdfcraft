@@ -1,13 +1,13 @@
 //! Synthetic edit journeys for craft-journeys.
 //!
-//! Usage: `edit_bench pages|form`. The document is generated and opened before timing; the
+//! Usage: `edit_bench pages|form [FILE] [FIELD]`. The document is opened before timing; the
 //! reported duration is one user-visible Session edit; craft-bench supplies the paired repeats.
 
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
-use pdfcraft_engine::{AddedText, Edit, FieldValue, Session};
+use pdfcraft_engine::{AddedText, Edit, FieldValue, FormFieldKind, Session};
 use sha2::{Digest, Sha256};
 
 const PAGE_COUNT: usize = 100_000;
@@ -68,20 +68,116 @@ fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn differential(path: &str) -> Result<(), Box<dyn Error>> {
+    use pdfcraft_cos::{Document, SaveOptions, write_incremental};
+    use pdfcraft_forms::{Field, FieldKind};
+
+    fn value(field: &Field) -> Option<FieldValue> {
+        if field.widgets.is_empty() {
+            return None;
+        }
+        match field.kind {
+            FieldKind::Text => Some(FieldValue::Text("1".into())),
+            FieldKind::CheckBox => Some(FieldValue::Check(field.value.is_empty())),
+            FieldKind::Radio => field.widgets.iter().find_map(|widget| widget.on_state.clone()).map(|state| FieldValue::Radio(Some(state))),
+            FieldKind::Combo | FieldKind::List => field.options.first().map(|(export, _)| FieldValue::Choice(vec![export.clone()])),
+            FieldKind::PushButton | FieldKind::Signature => None,
+        }
+    }
+
+    let bytes = Arc::new(std::fs::read(path)?);
+    let original = Document::open(bytes)?;
+    let all = pdfcraft_forms::fields(&original);
+    let mut compared = 0usize;
+    let mut direct = 0usize;
+    let mut indexed = 0usize;
+    let mut actionful = 0usize;
+    for field in &all {
+        let Some(next) = value(field) else { continue };
+        if !field.actions.is_empty() || !field.actions.unsupported.is_empty() {
+            actionful += 1;
+        }
+        let mut fast = original.clone();
+        let mut slow = original.clone();
+        let fast_result = match pdfcraft_forms::set_simple_field_value(&mut fast, &all, &field.name, &next) {
+            Ok(true) => {
+                direct += 1;
+                Ok(())
+            }
+            Ok(false) => {
+                indexed += 1;
+                pdfcraft_forms::set_value_with_fields(&mut fast, &all, &field.name, &next, &mut pdfcraft_forms::NoScripts)
+            }
+            Err(error) => Err(error),
+        };
+        let slow_result = pdfcraft_forms::set_value(&mut slow, &field.name, &next);
+        if format!("{fast_result:?}") != format!("{slow_result:?}") {
+            return Err(format!("fast and general setters return different results for {:?}: {fast_result:?} vs {slow_result:?}", field.name).into());
+        }
+        let fast_bytes = write_incremental(&fast, &SaveOptions::default())?;
+        let slow_bytes = write_incremental(&slow, &SaveOptions::default())?;
+        if fast_bytes != slow_bytes {
+            return Err(format!("fast and general setters differ for {:?}", field.name).into());
+        }
+        compared += 1;
+    }
+    println!("DIFFERENTIAL_FIELDS={compared}");
+    println!("DIFFERENTIAL_DIRECT={direct}");
+    println!("DIFFERENTIAL_INDEXED={indexed}");
+    println!("DIFFERENTIAL_ACTIONFUL={actionful}");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let journey = std::env::args().nth(1).ok_or("usage: edit_bench pages|form")?;
+    let mut args = std::env::args().skip(1);
+    let journey = args.next().ok_or("usage: edit_bench pages|form [FILE] [FIELD]")?;
+    let file = args.next();
+    let field_name = args.next();
+    if journey == "differential" {
+        return differential(file.as_deref().ok_or("usage: edit_bench differential FILE")?);
+    }
     let (pages, fields) = match journey.as_str() {
-        "pages" => (PAGE_COUNT, 0),
-        "form" => (1, FIELD_COUNT),
+        "pages" if file.is_none() => (PAGE_COUNT, 0),
+        "form" if file.is_none() => (1, FIELD_COUNT),
+        "pages" | "form" => return Err("synthetic journeys do not take a file".into()),
+        "pages-real" | "form-real" if file.is_some() => (0, 0),
         _ => return Err(format!("unknown journey {journey:?}").into()),
     };
-    let input = Arc::new(pdf(pages, fields));
+    let input = match file {
+        Some(ref path) => Arc::new(std::fs::read(path)?),
+        None => Arc::new(pdf(pages, fields)),
+    };
     let mut session = Session::new().with_clock(fixed_clock);
-    let id = session.open("synthetic-edit.pdf", None, input, None)?;
+    let id = session.open(file.as_deref().unwrap_or("synthetic-edit.pdf"), None, input, None)?;
+    let selected_field = if journey == "form-real" {
+        let doc = session.get(id).ok_or("the document did not open")?;
+        let field = field_name
+            .as_deref()
+            .and_then(|name| doc.form.iter().find(|field| field.name == name))
+            .or_else(|| {
+                doc.form.iter().find(|field| {
+                    field.kind == FormFieldKind::Text
+                        && !field.read_only()
+                        && !field.widgets.is_empty()
+                        && (field.actions.calculate != pdfcraft_forms::af::Calculate::None
+                            || field.actions.format != pdfcraft_forms::af::Format::None
+                            || field.actions.validate != pdfcraft_forms::af::Validate::None
+                            || field.actions.scripts.calculate.is_some()
+                            || field.actions.scripts.format.is_some()
+                            || field.actions.scripts.keystroke.is_some()
+                            || field.actions.scripts.validate.is_some())
+                })
+            })
+            .or_else(|| doc.form.iter().find(|field| field.kind == FormFieldKind::Text && !field.read_only() && !field.widgets.is_empty()))
+            .ok_or("the PDF has no editable text field")?;
+        Some(field.name.clone())
+    } else {
+        None
+    };
     let mut samples = Vec::with_capacity(RUNS);
     for run in 0..RUNS {
         let start = Instant::now();
-        if journey == "pages" {
+        if journey == "pages" || journey == "pages-real" {
             session.apply(
                 id,
                 Edit::AddText {
@@ -89,6 +185,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     text: AddedText { rect: [20.0, 250.0, 180.0, 280.0], text: format!("Edit {}", run % 2), ..Default::default() },
                 },
             )?;
+        } else if let Some(name) = selected_field.as_ref() {
+            session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text(format!("value{}", run % 2)) })?;
         } else {
             session.apply(id, Edit::SetFieldValue { name: "field0000".into(), value: FieldValue::Text(format!("value{}", run % 2)) })?;
         }
@@ -98,6 +196,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let doc = session.get(id).ok_or("the document disappeared")?;
     println!("CRAFT_JOURNEY_NS={}", samples[RUNS / 2]);
     println!("CRAFT_OUTPUT_SHA256={}", digest(doc.bytes.as_ref()));
-    println!("{journey}: {} pages, {fields} fields, {} bytes", pages, doc.bytes.len());
+    println!(
+        "{journey}: {} pages, {} fields, {}, {} bytes",
+        doc.info.pages.len(),
+        doc.form.len(),
+        selected_field.as_deref().unwrap_or("synthetic"),
+        doc.bytes.len()
+    );
     Ok(())
 }

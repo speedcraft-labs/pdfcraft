@@ -17,12 +17,32 @@ fn deletes_pages(edit: &Edit) -> bool {
     }
 }
 
-fn try_simple_text_field_edit(next: &mut pdfcraft_cos::Document, form: &[pdfcraft_forms::Field], edit: &Edit) -> Result<bool, EditError> {
-    let Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } = edit else {
+fn try_simple_field_edit(next: &mut pdfcraft_cos::Document, form: &[pdfcraft_forms::Field], edit: &Edit) -> Result<bool, EditError> {
+    let Edit::SetFieldValue { name, value } = edit else {
         return Ok(false);
     };
-    match guard(|| pdfcraft_forms::set_simple_text_value(next, form, name, value)) {
+    match guard(|| pdfcraft_forms::set_simple_field_value(next, form, name, value)) {
         Ok(result) => result.map_err(Into::into),
+        Err(message) => Err(EditError::Invalid(format!("{} failed unexpectedly ({message}); the document was not changed", edit.label()))),
+    }
+}
+
+fn try_indexed_field_edit(
+    next: &mut pdfcraft_cos::Document,
+    form: &[pdfcraft_forms::Field],
+    edit: &Edit,
+    scripts: Option<&mut js::JsRunner>,
+) -> Result<bool, EditError> {
+    let Edit::SetFieldValue { name, value } = edit else {
+        return Ok(false);
+    };
+    let result = match scripts {
+        Some(scripts) => guard(|| pdfcraft_forms::set_value_with_fields(next, form, name, value, scripts)),
+        None => guard(|| pdfcraft_forms::set_value_with_fields(next, form, name, value, &mut pdfcraft_forms::NoScripts)),
+    };
+    match result {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(error)) => Err(error.into()),
         Err(message) => Err(EditError::Invalid(format!("{} failed unexpectedly ({message}); the document was not changed", edit.label()))),
     }
 }
@@ -77,15 +97,30 @@ impl Session {
         cx.renamed_fields.clear();
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
-        let simple_text_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
-            try_simple_text_field_edit(&mut next, &doc.form, &edit)?
+        let fast_field_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
+            let actionful = doc.form.iter().any(|field| {
+                !field.actions.is_empty()
+                    || !field.actions.unsupported.is_empty()
+                    || field.actions.scripts.format.is_some()
+                    || field.actions.scripts.keystroke.is_some()
+                    || field.actions.scripts.validate.is_some()
+                    || field.actions.scripts.calculate.is_some()
+            });
+            if actionful {
+                if !js_off && uses_scripts(&edit) {
+                    cx.js = Some(js::JsRunner::new(&next, &name));
+                }
+                try_indexed_field_edit(&mut next, &doc.form, &edit, cx.js.as_mut())?
+            } else {
+                try_simple_field_edit(&mut next, &doc.form, &edit)?
+            }
         } else {
             false
         };
-        if !simple_text_applied && !js_off && uses_scripts(&edit) {
+        if !fast_field_applied && !js_off && uses_scripts(&edit) {
             cx.js = Some(js::JsRunner::new(&next, &name));
         }
-        if !simple_text_applied {
+        if !fast_field_applied {
             guard(|| run_edit(&mut next, &edit, &mut cx))
                 .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
         }
@@ -329,7 +364,7 @@ impl Session {
     fn refresh_scoped(doc: &mut Document, scope: Scope, edit: Option<&Edit>) -> Result<(), EditError> {
         if scope == Scope::Form
             && let Some(edit) = edit
-            && Self::refresh_simple_text_field(doc, edit)?
+            && Self::refresh_field_edit(doc, edit)?
         {
             return Ok(());
         }
@@ -418,39 +453,44 @@ impl Session {
         Ok(())
     }
 
-    /// A plain text field edit changes one value, one appearance and no form scripts. Preserve
-    /// the other display-only appearances from the previous display revision instead of reading
-    /// and re-appending every widget appearance on every keystroke.
-    fn refresh_simple_text_field(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
-        let Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } = edit else { return Ok(false) };
+    /// A field edit changes a small part of the form. Keep the existing display revision and
+    /// replace the appearances for fields whose values changed, including calculation results.
+    fn refresh_field_edit(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
+        let Edit::SetFieldValue { name, .. } = edit else { return Ok(false) };
         if doc.info.encrypted || doc.info.xfa.is_some() || !doc.signatures.is_empty() {
             return Ok(false);
         }
-        let updated_field = {
-            let fields = doc.form.as_ref();
-            if fields.iter().any(|field| {
-                !field.actions.is_empty()
-                    || !field.actions.unsupported.is_empty()
-                    || field.actions.scripts.format.is_some()
-                    || field.actions.scripts.keystroke.is_some()
-                    || field.actions.scripts.validate.is_some()
-                    || field.actions.scripts.calculate.is_some()
-            }) {
-                return Ok(false);
-            }
-            let mut matching = fields.iter().filter(|field| field.name == *name);
-            let Some(field) = matching.next() else { return Ok(false) };
-            if matching.next().is_some()
-                || field.kind != pdfcraft_forms::FieldKind::Text
-                || field.widgets.len() != 1
-                || field.widgets[0].obj != field.obj
-            {
-                return Ok(false);
-            }
-            let mut updated_field = field.clone();
-            updated_field.value = if value.is_empty() { Vec::new() } else { vec![value.clone()] };
-            updated_field
+        let old_fields = doc.form.clone();
+        let new_fields = {
+            let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
+            pdfcraft_forms::fields(&editor.cos)
         };
+        if old_fields.len() != new_fields.len()
+            || doc.info.fields.len() != new_fields.len()
+            || doc.info.fields.iter().zip(&new_fields).any(|(info, form)| info.name != form.name)
+        {
+            return Ok(false);
+        }
+        let mut changed = Vec::new();
+        for (old, new) in old_fields.iter().zip(&new_fields) {
+            if old.name != new.name || old.obj != new.obj {
+                return Ok(false);
+            }
+            let mut unchanged = old.clone();
+            unchanged.value = new.value.clone();
+            for (old_widget, new_widget) in unchanged.widgets.iter_mut().zip(&new.widgets) {
+                old_widget.state = new_widget.state.clone();
+            }
+            if unchanged != *new {
+                return Ok(false);
+            }
+            if old.value != new.value || old.widgets.iter().zip(&new.widgets).any(|(a, b)| a.state != b.state) {
+                changed.push(new);
+            }
+        }
+        if !changed.iter().any(|field| field.name == *name) {
+            return Ok(false);
+        }
 
         let old_display = doc.display.clone();
         let mut display = match pdfcraft_cos::Document::open_with_password(old_display, doc.password.as_deref()) {
@@ -459,8 +499,10 @@ impl Session {
         };
         {
             let Some(editor) = doc.editor.as_mut() else { return Ok(false) };
-            if !pdfcraft_forms::update_simple_text_field_display(&editor.cos, &mut display, &updated_field, &mut editor.field_appearances) {
-                return Ok(false);
+            for field in &changed {
+                if !pdfcraft_forms::update_field_display(&editor.cos, &mut display, field, &mut editor.field_appearances) {
+                    return Ok(false);
+                }
             }
         }
 
@@ -476,14 +518,16 @@ impl Session {
             Err(_) => return Ok(false),
         };
 
-        for field in &mut doc.info.fields {
-            if field.name == *name {
-                field.value = (!value.is_empty()).then(|| value.clone());
-            }
+        for (field, updated) in doc.info.fields.iter_mut().zip(&new_fields) {
+            field.value = match updated.kind {
+                pdfcraft_forms::FieldKind::CheckBox | pdfcraft_forms::FieldKind::Radio => {
+                    Some(updated.value.first().cloned().unwrap_or_else(|| "Off".into()))
+                }
+                _ if updated.value.is_empty() => None,
+                _ => Some(updated.value.join(", ")),
+            };
         }
-        for field in Arc::make_mut(&mut doc.form).iter_mut().filter(|field| field.name == *name) {
-            field.value = updated_field.value.clone();
-        }
+        doc.form = Arc::new(new_fields);
         doc.info.file_size = bytes.len();
         doc.display = display;
         doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));

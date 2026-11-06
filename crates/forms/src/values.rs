@@ -15,6 +15,13 @@ pub fn set_value(doc: &mut Document, name: &str, value: &FieldValue) -> Result<(
 /// [`set_value`], running the fields' JavaScript through `scripts`.
 pub fn set_value_with(doc: &mut Document, name: &str, value: &FieldValue, scripts: &mut dyn Scripts) -> Result<(), FormError> {
     let all = fields(doc);
+    set_value_with_fields(doc, &all, name, value, scripts)
+}
+
+/// [`set_value_with`], using the caller's current reading of the fields instead of reading them
+/// again. `all` must describe `doc` before this edit. It still runs validation, field actions and
+/// calculation scripts in the same order as [`set_value_with`].
+pub fn set_value_with_fields(doc: &mut Document, all: &[Field], name: &str, value: &FieldValue, scripts: &mut dyn Scripts) -> Result<(), FormError> {
     if all.is_empty() {
         return Err(FormError::NoForm);
     }
@@ -24,17 +31,21 @@ pub fn set_value_with(doc: &mut Document, name: &str, value: &FieldValue, script
     Ok(())
 }
 
-/// Set one unambiguous, actionless root text field using fields the caller already read.
+/// Set one unambiguous, actionless terminal field using fields the caller already read.
 /// `Ok(false)` means the field does not meet these conditions and the general setter should run.
-/// No calculations need recalculation: this function checks that every field has no actions.
+/// No calculations need recalculation: this function checks that every field has no actions. The
+/// field can be nested and can be text, a button, or a choice field.
 pub fn set_simple_text_value(doc: &mut Document, all: &[Field], name: &str, value: &str) -> Result<bool, FormError> {
+    set_simple_field_value(doc, all, name, &FieldValue::Text(value.into()))
+}
+
+/// Like [`set_simple_text_value`], for any actionless terminal field kind.
+pub fn set_simple_field_value(doc: &mut Document, all: &[Field], name: &str, value: &FieldValue) -> Result<bool, FormError> {
     let mut named = all.iter().filter(|field| field.name == name);
     let Some(field) = named.next() else { return Ok(false) };
     if named.next().is_some()
-        || field.kind != FieldKind::Text
-        || field.widgets.len() != 1
-        || field.widgets[0].obj != field.obj
-        || doc.get(field.obj).as_dict().is_none_or(|dict| dict.reference(b"Parent").is_some())
+        || field.widgets.is_empty()
+        || !matches!(field.kind, FieldKind::Text | FieldKind::CheckBox | FieldKind::Radio | FieldKind::Combo | FieldKind::List)
         || all.iter().any(|field| {
             !field.actions.is_empty()
                 || !field.actions.unsupported.is_empty()
@@ -50,7 +61,7 @@ pub fn set_simple_text_value(doc: &mut Document, all: &[Field], name: &str, valu
         return Err(FormError::ReadOnly(name.into()));
     }
     let mut scripts = NoScripts;
-    write_value(doc, field, &FieldValue::Text(value.into()), &mut scripts)?;
+    write_value(doc, field, value, &mut scripts)?;
     author::form_fonts_as_objects(doc, all)?;
     Ok(true)
 }
