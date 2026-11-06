@@ -503,6 +503,7 @@ impl Session {
     /// from undo/redo, re-reads both: always correct, rarely paid). The cached display
     /// appearances are kept: content edits leave every annotation dictionary alone.
     fn refresh_content(doc: &mut Document, edit: Option<&Edit>) -> Result<(), EditError> {
+        let display_is_source = Arc::ptr_eq(&doc.display, &doc.bytes);
         Self::release_working(doc);
         sync_xfa_state(doc);
         let Some(editor) = doc.editor.as_mut() else { return Ok(()) };
@@ -511,7 +512,8 @@ impl Session {
         } else {
             editor.cos.bytes().clone()
         };
-        // The edit must still leave a file the viewer can open; anything else rolls back above.
+        // Content edits cannot change the page tree. Reopen the written revision to catch an
+        // invalid edit, but skip counting all pages because the writer preserves that tree.
         pdfcraft_render::check_open(bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Reopen(e.to_string()))?;
         let (touches_added, touches_marks) = Self::content_refresh_lists(edit);
         if touches_added || touches_marks {
@@ -519,7 +521,7 @@ impl Session {
         }
         doc.info.file_size = bytes.len();
         let signatures = if doc.signatures.is_empty() { Vec::new() } else { signatures_of(&editor.cos, &bytes, &doc.trust, &doc.sig_cache) };
-        doc.display = display_bytes(Some(editor), &bytes);
+        doc.display = if display_is_source { bytes.clone() } else { display_bytes(Some(editor), &bytes) };
         doc.signatures = Arc::new(signatures);
         doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));
         doc.bytes = bytes;
