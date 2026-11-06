@@ -298,8 +298,17 @@ pub fn fields(doc: &Document) -> Vec<Field> {
 /// an edit. Callers that need action metadata can keep the original field index.
 pub fn current_field_value(doc: &Document, field: &Field) -> Field {
     let mut updated = field.clone();
+    refresh_field_value(doc, &mut updated);
+    updated
+}
+
+/// Refresh value, flags and widget state in an existing field entry, without allocating a new
+/// field or decoding its actions.
+pub fn refresh_field_value(doc: &Document, updated: &mut Field) {
+    let field_obj = updated.obj;
+    let field_kind = updated.kind;
     updated.flags = 0;
-    let mut current = Some(field.obj);
+    let mut current = Some(field_obj);
     let mut seen = std::collections::HashSet::new();
     let mut value = None;
     let mut found_value = false;
@@ -323,22 +332,21 @@ pub fn current_field_value(doc: &Document, field: &Field) -> Field {
     let mut budget = DecodeBudget::new(MAX_VALUE_BYTES, 0);
     updated.value = value.as_ref().map(|v| values_of(doc, Some(v), &mut budget)).unwrap_or_default();
 
-    let field_dict = doc.get(field.obj);
+    let field_dict = doc.get(field_obj);
     let field_dict = field_dict.as_dict();
     for widget in &mut updated.widgets {
         let object = doc.get(widget.obj);
         let Some(dict) = object.as_dict() else { continue };
         let annot_flags = dict.get(b"F").and_then(|f| doc.resolve(f).as_int()).unwrap_or(0);
-        let own_flags = if widget.obj == field.obj { 0 } else { field_flags(doc, dict).unwrap_or(0) };
+        let own_flags = if widget.obj == field_obj { 0 } else { field_flags(doc, dict).unwrap_or(0) };
         widget.state = dict.name(b"AS").map(name_text);
         widget.locked = annot_flags & 128 != 0;
         widget.hidden = annot_flags & (2 | 32) != 0;
         widget.read_only = (updated.flags | own_flags) & flags::READ_ONLY != 0;
-        if updated.kind == FieldKind::List {
+        if field_kind == FieldKind::List {
             widget.list = Some(appearance::list_rows_of(doc, &updated.da, field_dict, dict));
         }
     }
-    updated
 }
 
 /// How many of [`fields`] were reachable only through the page annotations: the form's `/Fields`

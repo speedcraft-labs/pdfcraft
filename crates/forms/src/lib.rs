@@ -45,7 +45,7 @@ pub use appearances::{
     update_simple_text_field_display, with_field_appearances, with_field_appearances_cached,
 };
 pub(crate) use read::page_refs;
-pub use read::{Fields, acroform, adopted_page_fields, current_field_value, fields, fields_with_adopted};
+pub use read::{Fields, acroform, adopted_page_fields, current_field_value, fields, fields_with_adopted, refresh_field_value};
 #[cfg(test)]
 use read::{MAX_SCRIPT_BYTES, PageWalk, enumerate, form_reads};
 use read::{script, script_budget};

@@ -549,37 +549,42 @@ impl Session {
         if doc.info.encrypted || !doc.signatures.is_empty() {
             return Ok(false);
         }
-        let old_fields = doc.form.clone();
-        let new_fields: Vec<_> = {
-            let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
-            old_fields.iter().map(|field| pdfcraft_forms::current_field_value(&editor.cos, field)).collect()
-        };
-        if old_fields.len() != new_fields.len()
-            || doc.info.fields.len() != new_fields.len()
-            || doc.info.fields.iter().zip(&new_fields).any(|(info, form)| info.name != form.name)
+        if doc.info.fields.len() != doc.form.len() || doc.info.fields.iter().zip(doc.form.iter()).any(|(info, form)| info.name != form.name) {
+            return Ok(false);
+        }
+        let mut changed_indices = Vec::new();
         {
+            let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
+            for (index, field) in Arc::make_mut(&mut doc.form).iter_mut().enumerate() {
+                let old_value = field.value.clone();
+                let old_flags = field.flags;
+                let old_widgets: Vec<_> = field
+                    .widgets
+                    .iter()
+                    .map(|widget| (widget.state.clone(), widget.locked, widget.hidden, widget.read_only, widget.list.clone()))
+                    .collect();
+                pdfcraft_forms::refresh_field_value(&editor.cos, field);
+                if field.flags != old_flags
+                    || field
+                        .widgets
+                        .iter()
+                        .zip(&old_widgets)
+                        .any(|(widget, old)| widget.locked != old.1 || widget.hidden != old.2 || widget.read_only != old.3)
+                {
+                    // The edit changed metadata outside the value cache; leave it to the full reader.
+                    return Ok(false);
+                }
+                if old_value != field.value
+                    || field.widgets.iter().zip(&old_widgets).any(|(widget, old)| widget.state != old.0 || widget.list != old.4)
+                {
+                    changed_indices.push(index);
+                }
+            }
+        }
+        if !changed_indices.iter().any(|&index| doc.form[index].name == *name) {
             return Ok(false);
         }
-        let mut changed = Vec::new();
-        for (old, new) in old_fields.iter().zip(&new_fields) {
-            if old.name != new.name || old.obj != new.obj {
-                return Ok(false);
-            }
-            let mut unchanged = old.clone();
-            unchanged.value = new.value.clone();
-            for (old_widget, new_widget) in unchanged.widgets.iter_mut().zip(&new.widgets) {
-                old_widget.state = new_widget.state.clone();
-            }
-            if unchanged != *new {
-                return Ok(false);
-            }
-            if old.value != new.value || old.widgets.iter().zip(&new.widgets).any(|(a, b)| a.state != b.state) {
-                changed.push(new);
-            }
-        }
-        if !changed.iter().any(|field| field.name == *name) {
-            return Ok(false);
-        }
+        let changed: Vec<_> = changed_indices.iter().map(|&index| doc.form[index].clone()).collect();
 
         // When the display bytes are the source bytes, the editor graph already contains the
         // updated field values. Clone that graph for the display-only appearance changes instead
@@ -621,7 +626,9 @@ impl Session {
             Err(_) => return Ok(false),
         };
 
-        for (field, updated) in doc.info.fields.iter_mut().zip(&new_fields) {
+        for &index in &changed_indices {
+            let field = &mut doc.info.fields[index];
+            let updated = &doc.form[index];
             field.value = match updated.kind {
                 pdfcraft_forms::FieldKind::CheckBox | pdfcraft_forms::FieldKind::Radio => {
                     Some(updated.value.first().cloned().unwrap_or_else(|| "Off".into()))
@@ -630,7 +637,6 @@ impl Session {
                 _ => Some(updated.value.join(", ")),
             };
         }
-        doc.form = Arc::new(new_fields);
         doc.info.file_size = bytes.len();
         doc.display = display;
         doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));
