@@ -1,7 +1,7 @@
 use super::draw::{draw, params};
 use super::layout::{first_undrawable, is_thai, nums, shaped_arabic, thai_error};
 use super::types::{Added, AddedImage, AddedText, CHAR_SPACING_LIMIT, Family, MarkerScan, TAG};
-use super::{Content, Dict, Document, EditError, GlyphError, MarkKind, ObjRef, Object, Stream, align_from, check, contents, page_list, place_tagged};
+use super::{Content, Dict, Document, EditError, GlyphError, MarkKind, ObjRef, Object, Stream, align_from, contents, page_list, place_tagged};
 
 fn parse(doc: &Document, d: &Dict) -> Option<Content> {
     let r = nums(doc, d.get(b"Rect"));
@@ -48,6 +48,29 @@ fn parse(doc: &Document, d: &Dict) -> Option<Content> {
         }
         _ => None,
     }
+}
+
+fn added_count_on_page(doc: &Document, page: usize) -> Result<usize, EditError> {
+    let page_info = pdfcraft_model::page_at(doc, page).ok_or(EditError::NoSuchPage(page))?;
+    let mut count = 0usize;
+    for_each_content_entry(doc, &page_info, |entry| {
+        if Object::as_ref(entry).is_none() {
+            return;
+        }
+        with_resolved(doc, entry, |resolved| {
+            let Some(dict) = resolved.as_dict() else { return };
+            if dict.name(b"PCMark") != Some(TAG.as_bytes()) {
+                return;
+            }
+            let Some(params) = dict.get(b"PCAdded") else { return };
+            with_resolved(doc, params, |resolved| {
+                if resolved.as_dict().is_some_and(|params| parse(doc, params).is_some()) {
+                    count = count.saturating_add(1);
+                }
+            });
+        });
+    });
+    Ok(count)
 }
 
 fn with_resolved<T>(doc: &Document, object: &Object, f: impl FnOnce(&Object) -> T) -> T {
@@ -171,9 +194,7 @@ fn validate(c: &Content) -> Result<(), EditError> {
 /// Write an item's stream (new, or replacing `obj`) and make its resources available to the page.
 fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>) -> Result<ObjRef, EditError> {
     validate(c)?;
-    let all = page_list(doc);
-    check(&[page], all.len())?;
-    let p = &all[page];
+    let p = pdfcraft_model::page_at(doc, page).ok_or(EditError::NoSuchPage(page))?;
     let view = p.view_matrix(doc);
     let user_unit = p.user_unit(doc);
     // The page gets its own copy of its resources with the item's fonts and images added, and
@@ -185,7 +206,7 @@ fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>) -> R
     let taken = pres.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
     let (content, res) = draw(doc, c, view, &taken, obj.is_some())?;
     if obj.is_none() {
-        crate::check_on_top(doc, p)?;
+        crate::check_on_top(doc, &p)?;
     }
     for (k, v) in res.iter() {
         let mut sub = pres.get(k).map(|s| doc.resolve(s)).and_then(|s| s.as_dict().cloned()).unwrap_or_default();
@@ -210,9 +231,7 @@ fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>) -> R
         }
         None => {
             // place_tagged appends a new stream; recover its reference.
-            let p = page_list(doc).swap_remove(page);
             place_tagged(doc, &p, TAG, content.clone(), false)?;
-            let p = page_list(doc).swap_remove(page);
             let r = contents(doc, &p)?.last().and_then(Object::as_ref).ok_or_else(|| EditError::Invalid("could not add the content".into()))?;
             doc.set(r, Object::Stream(stream));
             Ok(r)
@@ -227,8 +246,9 @@ pub fn list_added(doc: &Document) -> Vec<Added> {
 
 /// Add an item to a page (0-based). Returns its index among the page's added items.
 pub fn add_content(doc: &mut Document, page: usize, c: &Content) -> Result<usize, EditError> {
+    let index = added_count_on_page(doc, page)?;
     write(doc, page, c, None)?;
-    Ok(list_added(doc).iter().filter(|a| a.page == page).count() - 1)
+    Ok(index)
 }
 
 fn find(doc: &Document, page: usize, index: usize) -> Result<Added, EditError> {

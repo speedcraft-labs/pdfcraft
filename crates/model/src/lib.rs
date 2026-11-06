@@ -88,6 +88,12 @@ pub fn pages(doc: &Document) -> Vec<Page> {
     PageTree::new(doc).collect()
 }
 
+/// The page at zero-based `index`, walking only as far as that page. Edits to one page should
+/// not materialize every page in the document just to retrieve its object.
+pub fn page_at(doc: &Document, index: usize) -> Option<Page> {
+    PageTree::new(doc).nth(index)
+}
+
 /// Approximate bytes of inherited values copied into leaf dictionaries by one page walk.
 pub const MAX_INHERITED_COPIES: usize = 1 << 30;
 
@@ -266,6 +272,14 @@ mod tests {
         assert!(copied <= budget, "{copied} bytes of inherited values copied into {} pages", pages.len());
         assert_eq!(pages.len(), budget / each);
         assert_eq!(super::pages(&d).len(), 200);
+    }
+
+    #[test]
+    fn page_at_matches_document_order_and_rejects_past_the_end() {
+        let d = doc(0);
+        let pages = pages(&d);
+        assert_eq!(page_at(&d, 0), pages.first().cloned());
+        assert_eq!(page_at(&d, 1), None);
     }
 
     #[test]

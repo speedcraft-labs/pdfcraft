@@ -20,7 +20,29 @@ pub(super) fn load_options(password: Option<&str>) -> LoadOptions {
 /// but must still catch an edit that produced something the viewer cannot display, so the
 /// caller can roll it back. Never panics: parser crashes are caught and reported.
 pub fn check_pages(bytes: Arc<Vec<u8>>, password: Option<&str>, expected: usize) -> Result<(), OpenError> {
-    let pdf = catch_unwind(AssertUnwindSafe(|| Pdf::new_with_password(bytes, password.unwrap_or(""))))
+    let pdf = open_for_check(bytes, password)?;
+    let pages = catch_unwind(AssertUnwindSafe(|| pdf.pages().len()))
+        .map_err(|p| OpenError::Invalid(format!("the page tree could not be read: {}", crate::raster::panic_message(&p))))?;
+    if pages != expected {
+        return Err(OpenError::Invalid(format!("the edit changed the page count from {expected} to {pages}")));
+    }
+    Ok(())
+}
+
+/// Check that the incremental revision's cross-reference chain and catalog can be read.
+/// Content-only edits leave the already-opened page tree unchanged, so reopening it through the
+/// renderer (which eagerly materializes every page) would make an edit O(page count).
+pub fn check_open(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<(), OpenError> {
+    pdfcraft_cos::Document::open_with_stream_limit(bytes, password, LOAD_STREAM_LIMIT).map(drop).map_err(|error| match error {
+        pdfcraft_cos::CosError::NeedsPassword => OpenError::NeedsPassword,
+        pdfcraft_cos::CosError::WrongPassword => OpenError::WrongPassword,
+        pdfcraft_cos::CosError::Security(detail) => OpenError::Unsupported(format!("encryption not supported: {detail}")),
+        other => OpenError::Invalid(format!("the incremental revision could not be reopened: {other}")),
+    })
+}
+
+fn open_for_check(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<Pdf, OpenError> {
+    catch_unwind(AssertUnwindSafe(|| Pdf::new_with_password(bytes, password.unwrap_or(""))))
         .map_err(|p| OpenError::Invalid(format!("the parser crashed: {}", crate::raster::panic_message(&p))))?
         .map_err(|e| match e {
             LoadPdfError::Decryption(DecryptionError::PasswordProtected) => {
@@ -32,13 +54,7 @@ pub fn check_pages(bytes: Arc<Vec<u8>>, password: Option<&str>, expected: usize)
             }
             LoadPdfError::Decryption(other) => OpenError::Unsupported(format!("encryption not supported: {other:?}")),
             LoadPdfError::Invalid => OpenError::Invalid("no readable page tree or cross-reference data was found".into()),
-        })?;
-    let pages = catch_unwind(AssertUnwindSafe(|| pdf.pages().len()))
-        .map_err(|p| OpenError::Invalid(format!("the page tree could not be read: {}", crate::raster::panic_message(&p))))?;
-    if pages != expected {
-        return Err(OpenError::Invalid(format!("the edit changed the page count from {expected} to {pages}")));
-    }
-    Ok(())
+        })
 }
 
 /// Inspect a document. Fails only if the renderer itself cannot open the file (or needs a

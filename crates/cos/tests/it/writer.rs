@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use pdfcraft_cos::{Dict, Document, ObjRef, Object, SaveOptions, Stream, write_full, write_incremental};
+use std::io::Write;
+
+use pdfcraft_cos::{Dict, Document, ObjRef, Object, SaveOptions, Stream, save_in_place, write_full, write_incremental, write_incremental_to};
 use pdfcraft_testkit::Pdf;
 
 /// Four pages, a shared font, document info with a non-ASCII title.
@@ -522,4 +524,241 @@ fn incremental_saves_of_a_file_whose_offsets_count_from_its_first_byte_keep_coun
     assert!(back.xref_entry_is_exact(1));
     // No qpdf check here: qpdf counts every offset from the header in a file with bytes before
     // it, so it already reconstructs this input before anything is appended.
+}
+
+/// The streamed writer (`write_incremental_to`, #55) writes what the buffered one does on every
+/// style of original, and its output reopens cleanly, keeps the old revision readable, and
+/// passes the external checker where one is installed.
+#[test]
+fn streamed_incremental_saves_reopen_and_pass_qpdf() {
+    let stream_original = Arc::new(write_full(&Document::open(Arc::new(fixture())).unwrap(), &SaveOptions::default()).unwrap());
+    let originals: Vec<(&str, Arc<Vec<u8>>)> =
+        vec![("table", Arc::new(fixture())), ("xref stream", stream_original), ("no final newline", Arc::new(fixture().trim_ascii_end().to_vec()))];
+    for (name, original) in originals {
+        let mut doc = Document::open(original.clone()).unwrap();
+        doc.update_dict(ObjRef::new(1, 0), |d| d.set(b"Lang".to_vec(), Object::String(pdfcraft_cos::PdfString::literal(b"en".to_vec())))).unwrap();
+        doc.add(Object::Int(42));
+        let mut streamed = Vec::new();
+        write_incremental_to(&doc, &SaveOptions::default(), &mut streamed).unwrap();
+        assert_eq!(streamed, write_incremental(&doc, &SaveOptions::default()).unwrap(), "{name}");
+        assert!(streamed.starts_with(&original), "{name}: an incremental save only appends");
+
+        let back = Document::open(Arc::new(streamed.clone())).unwrap();
+        assert!(back.repair_log().is_empty(), "{name}: {:?}", back.repair_log());
+        assert_eq!(back.revisions().len(), 2, "{name}");
+        let edited = back.get(ObjRef::new(1, 0));
+        assert_eq!(edited.as_dict().unwrap().get(b"Lang").and_then(|o| o.as_string()).map(|s| s.bytes.as_slice()), Some(b"en".as_slice()), "{name}");
+        assert_eq!(hayro_pages(&streamed), 4, "{name}");
+        assert_qpdf_clean(&streamed);
+    }
+}
+
+/// A folder that is removed when the test is done, holding one saved document.
+fn work_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pdfcraft-cos-inplace-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn dir_holds_only_the_document(dir: &std::path::Path) {
+    let left: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left, ["doc.pdf"], "staging left behind: {left:?}");
+}
+
+#[test]
+fn saving_in_place_appends_through_staging_and_stacks() {
+    let dir = work_dir("append");
+    let path = dir.join("doc.pdf");
+    std::fs::write(&path, fixture()).unwrap();
+    let doc = Document::open(Arc::new(std::fs::read(&path).unwrap())).unwrap();
+    let mut doc = doc.clone();
+    doc.update_dict(ObjRef::new(1, 0), |d| d.set(b"Lang".to_vec(), Object::String(pdfcraft_cos::PdfString::literal(b"en".to_vec())))).unwrap();
+    save_in_place(&doc, &SaveOptions::default(), &path).unwrap();
+    let on_disk = std::fs::read(&path).unwrap();
+    assert_eq!(on_disk, write_incremental(&doc, &SaveOptions::default()).unwrap(), "in place saving writes the same bytes as the buffered writer");
+    dir_holds_only_the_document(&dir);
+
+    let back = Document::open(Arc::new(on_disk.clone())).unwrap();
+    assert!(back.repair_log().is_empty(), "{:?}", back.repair_log());
+    assert_eq!(back.revisions().len(), 2);
+    assert_eq!(hayro_pages(&on_disk), 4);
+    assert_qpdf_clean(&on_disk);
+
+    // A second save stacks another revision on the first, through the same staging.
+    let mut again = back.clone();
+    again.update_dict(ObjRef::new(1, 0), |d| d.set(b"Lang".to_vec(), Object::String(pdfcraft_cos::PdfString::literal(b"fr".to_vec())))).unwrap();
+    save_in_place(&again, &SaveOptions::default(), &path).unwrap();
+    let stacked = std::fs::read(&path).unwrap();
+    assert!(stacked.starts_with(&on_disk), "the second save only appends to the first");
+    assert!(stacked.len() > on_disk.len());
+    let back = Document::open(Arc::new(stacked.clone())).unwrap();
+    assert!(back.repair_log().is_empty(), "{:?}", back.repair_log());
+    assert_eq!(back.revisions().len(), 3);
+    assert_eq!(hayro_pages(&stacked), 4);
+    assert_qpdf_clean(&stacked);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn saving_in_place_refuses_a_file_that_changed_under_the_document() {
+    let dir = work_dir("changed");
+    let path = dir.join("doc.pdf");
+    std::fs::write(&path, fixture()).unwrap();
+    let doc = Document::open(Arc::new(std::fs::read(&path).unwrap())).unwrap();
+    let mut changed = fixture();
+    changed.extend_from_slice(b"%another writer was here\n");
+    std::fs::write(&path, &changed).unwrap();
+    let error = save_in_place(&doc, &SaveOptions::default(), &path).unwrap_err();
+    assert!(matches!(error, pdfcraft_cos::CosError::Io(_)), "{error:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), changed, "the file on disk is untouched");
+    dir_holds_only_the_document(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn saving_in_place_refuses_a_read_only_file() {
+    let dir = work_dir("readonly");
+    let path = dir.join("doc.pdf");
+    let original = fixture();
+    std::fs::write(&path, &original).unwrap();
+    let writable = std::fs::metadata(&path).unwrap().permissions();
+    let mut read_only = writable.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&path, read_only).unwrap();
+    let doc = Document::open(Arc::new(original.clone())).unwrap();
+    let error = save_in_place(&doc, &SaveOptions::default(), &path).unwrap_err();
+    assert!(matches!(error, pdfcraft_cos::CosError::Io(_)), "{error:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), original, "the read-only file is untouched");
+    dir_holds_only_the_document(&dir);
+    std::fs::set_permissions(&path, writable).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn saving_in_place_rebuilds_a_file_that_vanished() {
+    let dir = work_dir("vanished");
+    let path = dir.join("doc.pdf");
+    let original = fixture();
+    std::fs::write(&path, &original).unwrap();
+    let mut doc = Document::open(Arc::new(original)).unwrap();
+    doc.update_dict(ObjRef::new(1, 0), |d| d.set(b"Lang".to_vec(), Object::String(pdfcraft_cos::PdfString::literal(b"en".to_vec())))).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    save_in_place(&doc, &SaveOptions::default(), &path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), write_incremental(&doc, &SaveOptions::default()).unwrap());
+    dir_holds_only_the_document(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn saving_in_place_rewrites_a_reconstructed_document_in_full() {
+    let dir = work_dir("rebuilt");
+    let path = dir.join("doc.pdf");
+    let mut damaged = fixture();
+    // A cross-reference table of junk: the document reopens, reconstructed from object headers.
+    let at = damaged.windows(4).rposition(|w| w == b"xref").unwrap();
+    for byte in &mut damaged[at..at + 16] {
+        *byte = b'#';
+    }
+    std::fs::write(&path, &damaged).unwrap();
+    let doc = Document::open(Arc::new(damaged)).unwrap();
+    assert!(doc.reconstructed(), "the fixture must reach the full-rewrite branch");
+    save_in_place(&doc, &SaveOptions::default(), &path).unwrap();
+    let on_disk = std::fs::read(&path).unwrap();
+    assert_eq!(on_disk, write_full(&doc, &SaveOptions::default()).unwrap());
+    let back = Document::open(Arc::new(on_disk.clone())).unwrap();
+    assert!(back.repair_log().is_empty(), "{:?}", back.repair_log());
+    assert_eq!(back.revisions().len(), 1);
+    assert_eq!(hayro_pages(&on_disk), 4);
+    assert_qpdf_clean(&on_disk);
+    dir_holds_only_the_document(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A ~`size`-byte one-page scanned-style file: one stream dominates, so the document's own
+/// bytes are the fixture and everything else is small.
+fn scanned(size: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size + 1024);
+    out.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = Vec::new();
+    for (i, body) in [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 4 0 R >>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    offsets.push(out.len());
+    out.extend_from_slice(format!("4 0 obj\n<< /Length {size} >>\nstream\n").as_bytes());
+    out.extend(std::iter::repeat_n(b'0', size));
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref = out.len();
+    out.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// What a save hands its writer: the largest single buffer (the biggest thing it built in
+/// memory) and the total. Everything a save writes passes through here, so a save that never
+/// holds the file it is copying never asks for a buffer anywhere near its size (#55).
+struct Measured {
+    file: std::fs::File,
+    max_write: usize,
+    total: usize,
+}
+
+impl Write for Measured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.max_write = self.max_write.max(buf.len());
+        self.total += buf.len();
+        self.file.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[ignore = "builds a 200 MB document; run with cargo test -- --ignored"]
+#[test]
+fn a_200_mb_incremental_save_allocates_like_its_revision_not_like_its_file() {
+    const SIZE: usize = 200 * 1024 * 1024;
+    let dir = work_dir("large");
+    let out_path = dir.join("out.pdf");
+    let doc = Document::open(Arc::new(scanned(SIZE))).unwrap();
+    let mut doc = doc.clone();
+    doc.update_dict(ObjRef::new(1, 0), |d| d.set(b"Lang".to_vec(), Object::String(pdfcraft_cos::PdfString::literal(b"en".to_vec())))).unwrap();
+
+    let mut sink = Measured { file: std::fs::File::create(&out_path).unwrap(), max_write: 0, total: 0 };
+    write_incremental_to(&doc, &SaveOptions::default(), &mut sink).unwrap();
+    sink.flush().unwrap();
+    let (max_write, total) = (sink.max_write, sink.total);
+    drop(sink);
+
+    // The original went through in 64 KiB pieces — never one buffer near the file's size — and
+    // the whole save wrote only a little more than the file itself: the revision, nothing else.
+    assert_eq!(max_write, 64 * 1024, "the largest buffer handed over");
+    assert!(total > SIZE, "the original was streamed through: {total}");
+    assert!(total < SIZE + 64 * 1024, "the revision is a few small objects: {}", total - SIZE);
+
+    // The buffered writer answers with exactly those bytes — held as one allocation of the
+    // whole file, which is what the streamed form exists not to need.
+    let buffered = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    assert_eq!(buffered.len(), total);
+    assert_eq!(buffered.capacity(), buffered.len());
+    drop(buffered);
+
+    let saved = std::fs::read(&out_path).unwrap();
+    let back = Document::open(Arc::new(saved)).unwrap();
+    assert!(back.repair_log().is_empty(), "{:?}", back.repair_log());
+    assert_eq!(back.revisions().len(), 2);
+    let edited = back.get(ObjRef::new(1, 0));
+    assert_eq!(edited.as_dict().unwrap().get(b"Lang").and_then(|o| o.as_string()).map(|s| s.bytes.as_slice()), Some(b"en".as_slice()));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

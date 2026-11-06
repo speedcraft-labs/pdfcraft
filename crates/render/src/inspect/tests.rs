@@ -1552,6 +1552,15 @@ fn pdf_of(bodies: &[String]) -> Vec<u8> {
     out
 }
 
+#[test]
+fn check_open_reads_the_incremental_catalog_without_materializing_pages() {
+    // Content-only callers arrive after the page tree was checked on initial open. This
+    // deliberately broken /Pages object proves the incremental check does not traverse it again.
+    let bytes = pdf_of(&["<< /Type /Catalog /Pages 2 0 R >>".into(), "<< /Type /NotPages >>".into()]);
+    assert!(check_open(Arc::new(bytes), None).is_ok());
+    assert!(check_open(Arc::new(b"not a PDF".to_vec()), None).is_err());
+}
+
 /// A one-page file whose outline is `items` (objects 5, 6, … in order).
 fn outline_file(items: &[String]) -> Vec<u8> {
     let mut bodies = vec![

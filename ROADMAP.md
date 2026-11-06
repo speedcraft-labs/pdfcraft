@@ -3,6 +3,7 @@
 > **Last reviewed:** 2026-11-03 | **Last updated:** 2026-11-03 | **Change:** patch (M5 #5850 review: indirect typewriter intent and composer edits preserve outer whitespace; movement regression commits by outside click; estimates unchanged)
 
 > **Last reviewed:** 2026-11-03 | **Last updated:** 2026-11-03 | **Change:** patch (M5 #5850: Enter adds Fill & Sign line breaks; outside clicks commit, Escape cancels, and saved multiline appearances retain their text and height; estimates unchanged)
+> **Last reviewed:** 2026-11-06 · **Last updated:** 2026-11-06 · **Change:** minor (M14, #244 PdfCraft page-edit and AcroForm latency budgets; estimates unchanged)
 
 > **Last reviewed:** 2026-11-01 | **Last updated:** 2026-11-01 | **Change:** patch (M7, PR #2155 further review: inherited drawing/text state, affine image gestures, paste/selection ownership, no-op scripts and menu permissions; estimates unchanged)
 
@@ -236,6 +237,7 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 - **2026-11-02 (M10, #5743):** macOS print jobs name their title and owner (`com.apple.print.JobInfo.PMJobName`, `PMJobOwner`), as the system print dialog does, because a Kyocera filter crashes on a job without them. Checked by a test and through `doc_print` against a stand-in `lp`; not yet on a physical printer.
 
 - **2026-11-02 (M14, #5737, #5460):** Preferences can turn off the update check at start. It stays on by default, and Help ▸ Check for updates still asks.
+- **2026-11-06 (M14, #244):** The wired PdfCraft journeys now edit a 100,000-page synthetic file in 14.450 ms from a 1,683.158 ms baseline (new/old ratio 0.008585, 95% CI 0.008021–0.009215), and a 3,129-field form in 16.176 ms from 482.868 ms (ratio 0.033499, CI 0.031476–0.036787). Both outputs are hash-checked; fixtures are deterministic and synthetic. The form fast path applies only to one unique actionless root text field and preserves the general setter output byte-for-byte. Wider latency budgets remain; estimates unchanged.
 
 - **2026-11-01 (M7, #5657):** Header/footer, watermark and background additions and replacements stage the complete call before committing. Synthetic later-page failures preserve exact incremental bytes, object count, dirty state and allocation cursor; success controls retain other marks and shared/inherited resources. Estimates unchanged.
 
@@ -848,3 +850,5 @@ PR #2133 retains document-local Pages sidebar focus for Ctrl/Cmd+A and Escape af
 PR #1952 retains per-widget checkbox/radio export-value editing in the split form-authoring and Prepare modules. Caption editing remains supported. Tests cover preserved appearances and selection, invalid/locked refusals, data-format round trips, and Apply/Cancel/Undo. Current-head hosted validation is pending; feature estimates are unchanged.
 
 - **2026-10-31 (#1577):** Reconciled the page-shadow preference with split viewer, organizer, settings and control modules, preserving upstream page-gap shadow suppression. CI validation pending.
+
+- **2026-11-03 (#55):** `cos` streams incremental saves (`write_incremental_to`, `save_in_place` staging append) instead of allocating a second copy of the whole file; the buffered `Vec` API stays, byte-identical (differential tests against the previous writer, qpdf-checked, 200 MB ignored memory test, fault-injected staging). Engine save paths unchanged and green.

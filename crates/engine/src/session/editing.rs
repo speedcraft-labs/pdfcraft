@@ -17,6 +17,16 @@ fn deletes_pages(edit: &Edit) -> bool {
     }
 }
 
+fn try_simple_text_field_edit(next: &mut pdfcraft_cos::Document, form: &[pdfcraft_forms::Field], edit: &Edit) -> Result<bool, EditError> {
+    let Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } = edit else {
+        return Ok(false);
+    };
+    match guard(|| pdfcraft_forms::set_simple_text_value(next, form, name, value)) {
+        Ok(result) => result.map_err(Into::into),
+        Err(message) => Err(EditError::Invalid(format!("{} failed unexpectedly ({message}); the document was not changed", edit.label()))),
+    }
+}
+
 impl Session {
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
@@ -64,14 +74,21 @@ impl Session {
             return Ok(());
         }
         let mut next = editor.cos.clone();
-        if !js_off && uses_scripts(&edit) {
-            cx.js = Some(js::JsRunner::new(&next, &name));
-        }
         cx.renamed_fields.clear();
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
-        guard(|| run_edit(&mut next, &edit, &mut cx))
-            .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+        let simple_text_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
+            try_simple_text_field_edit(&mut next, &doc.form, &edit)?
+        } else {
+            false
+        };
+        if !simple_text_applied && !js_off && uses_scripts(&edit) {
+            cx.js = Some(js::JsRunner::new(&next, &name));
+        }
+        if !simple_text_applied {
+            guard(|| run_edit(&mut next, &edit, &mut cx))
+                .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+        }
         // Redaction removed what its own interpreter places under the marks. The marks were drawn
         // over the page as the renderer shows it, so the renderer has the last word.
         if let Edit::ApplyRedactions { pages } = &edit {
@@ -191,8 +208,9 @@ impl Session {
         }
         editor.redo.clear();
         Self::adopt_keys(doc);
-        let refreshed = guard(|| if scope == Scope::Content { Self::refresh_content(doc, Some(&edit)) } else { Self::refresh_scoped(doc, scope) })
-            .unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed =
+            guard(|| if scope == Scope::Content { Self::refresh_content(doc, Some(&edit)) } else { Self::refresh_scoped(doc, scope, Some(&edit)) })
+                .unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             // Roll back: the edit produced something we cannot display.
             if let Some(ed) = doc.editor.as_mut()
@@ -239,7 +257,7 @@ impl Session {
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.redo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.redo.pop()
@@ -268,7 +286,7 @@ impl Session {
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.undo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.undo.pop()
@@ -308,7 +326,13 @@ impl Session {
     /// keep the renderer; other scopes also replace it.
     /// Comment and form edits skip the full re-inspection (seconds on very large files): the
     /// comment list and field values are re-read from the object graph instead.
-    fn refresh_scoped(doc: &mut Document, scope: Scope) -> Result<(), EditError> {
+    fn refresh_scoped(doc: &mut Document, scope: Scope, edit: Option<&Edit>) -> Result<(), EditError> {
+        if scope == Scope::Form
+            && let Some(edit) = edit
+            && Self::refresh_simple_text_field(doc, edit)?
+        {
+            return Ok(());
+        }
         if scope == Scope::Full || doc.info.encrypted != doc.editor.as_ref().is_some_and(|e| e.cos.output_handler().is_some()) {
             return Self::refresh(doc);
         }
@@ -394,6 +418,79 @@ impl Session {
         Ok(())
     }
 
+    /// A plain text field edit changes one value, one appearance and no form scripts. Preserve
+    /// the other display-only appearances from the previous display revision instead of reading
+    /// and re-appending every widget appearance on every keystroke.
+    fn refresh_simple_text_field(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
+        let Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } = edit else { return Ok(false) };
+        if doc.info.encrypted || doc.info.xfa.is_some() || !doc.signatures.is_empty() {
+            return Ok(false);
+        }
+        let updated_field = {
+            let fields = doc.form.as_ref();
+            if fields.iter().any(|field| {
+                !field.actions.is_empty()
+                    || !field.actions.unsupported.is_empty()
+                    || field.actions.scripts.format.is_some()
+                    || field.actions.scripts.keystroke.is_some()
+                    || field.actions.scripts.validate.is_some()
+                    || field.actions.scripts.calculate.is_some()
+            }) {
+                return Ok(false);
+            }
+            let mut matching = fields.iter().filter(|field| field.name == *name);
+            let Some(field) = matching.next() else { return Ok(false) };
+            if matching.next().is_some()
+                || field.kind != pdfcraft_forms::FieldKind::Text
+                || field.widgets.len() != 1
+                || field.widgets[0].obj != field.obj
+            {
+                return Ok(false);
+            }
+            let mut updated_field = field.clone();
+            updated_field.value = if value.is_empty() { Vec::new() } else { vec![value.clone()] };
+            updated_field
+        };
+
+        let old_display = doc.display.clone();
+        let mut display = match pdfcraft_cos::Document::open_with_password(old_display, doc.password.as_deref()) {
+            Ok(display) => display,
+            Err(_) => return Ok(false),
+        };
+        {
+            let Some(editor) = doc.editor.as_mut() else { return Ok(false) };
+            if !pdfcraft_forms::update_simple_text_field_display(&editor.cos, &mut display, &updated_field, &mut editor.field_appearances) {
+                return Ok(false);
+            }
+        }
+
+        Self::release_working(doc);
+        let Some(editor) = doc.editor.as_ref() else { return Ok(true) };
+        let bytes = if editor.cos.is_modified() {
+            Arc::new(write_incremental(&editor.cos, &SaveOptions::default()).map_err(|error| EditError::Write(error.to_string()))?)
+        } else {
+            editor.cos.bytes().clone()
+        };
+        let display = match write_incremental(&display, &SaveOptions::default()) {
+            Ok(display) => Arc::new(display),
+            Err(_) => return Ok(false),
+        };
+
+        for field in &mut doc.info.fields {
+            if field.name == *name {
+                field.value = (!value.is_empty()).then(|| value.clone());
+            }
+        }
+        for field in Arc::make_mut(&mut doc.form).iter_mut().filter(|field| field.name == *name) {
+            field.value = updated_field.value.clone();
+        }
+        doc.info.file_size = bytes.len();
+        doc.display = display;
+        doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));
+        doc.bytes = bytes;
+        Ok(true)
+    }
+
     /// Which derived lists a content-only edit can change: added content (`None`, from
     /// undo/redo, re-reads both: always correct, rarely paid).
     pub(crate) fn content_refresh_lists(edit: Option<&Edit>) -> (bool, bool) {
@@ -429,6 +526,7 @@ impl Session {
     /// from undo/redo, re-reads both: always correct, rarely paid). The cached display
     /// appearances are kept: content edits leave every annotation dictionary alone.
     fn refresh_content(doc: &mut Document, edit: Option<&Edit>) -> Result<(), EditError> {
+        let display_is_source = Arc::ptr_eq(&doc.display, &doc.bytes);
         Self::release_working(doc);
         sync_xfa_state(doc);
         let Some(editor) = doc.editor.as_mut() else { return Ok(()) };
@@ -437,15 +535,16 @@ impl Session {
         } else {
             editor.cos.bytes().clone()
         };
-        // The edit must still leave a file the viewer can open; anything else rolls back above.
-        pdfcraft_render::check_pages(bytes.clone(), doc.password.as_deref(), doc.info.pages.len()).map_err(|e| EditError::Reopen(e.to_string()))?;
+        // Validate the written xref chain and catalog without re-materializing the unchanged
+        // page tree: Hayro's constructor eagerly walks every page.
+        pdfcraft_render::check_open(bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Reopen(e.to_string()))?;
         let (touches_added, touches_marks) = Self::content_refresh_lists(edit);
         if touches_added || touches_marks {
             doc.marker_scan = OnceLock::new();
         }
         doc.info.file_size = bytes.len();
         let signatures = if doc.signatures.is_empty() { Vec::new() } else { signatures_of(&editor.cos, &bytes, &doc.trust, &doc.sig_cache) };
-        doc.display = display_bytes(Some(editor), &bytes);
+        doc.display = if display_is_source { bytes.clone() } else { display_bytes(Some(editor), &bytes) };
         doc.signatures = Arc::new(signatures);
         doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));
         doc.bytes = bytes;

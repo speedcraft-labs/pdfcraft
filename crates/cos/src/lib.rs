@@ -30,7 +30,7 @@ pub use parser::{Lexer, is_whitespace, parse_indirect};
 pub use pdfcraft_crypt::{
     Algorithm, Auth, Method as CryptMethod, NewEncryption, Permissions, SecurityHandler, effective_password, pdfdoc_byte, pdfdoc_char,
 };
-pub use writer::{SaveOptions, pdf_date, serialize, write_full, write_incremental};
+pub use writer::{SaveOptions, pdf_date, save_in_place, serialize, write_full, write_incremental, write_incremental_to};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CosError {
@@ -54,4 +54,6 @@ pub enum CosError {
     Poisoned,
     #[error("this document was opened read-only with a decode limit and cannot be saved")]
     ReadOnlyLimit,
+    #[error("writing the file failed: {0}")]
+    Io(String),
 }
