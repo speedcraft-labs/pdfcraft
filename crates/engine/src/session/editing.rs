@@ -17,6 +17,16 @@ fn deletes_pages(edit: &Edit) -> bool {
     }
 }
 
+fn try_simple_text_field_edit(next: &mut pdfcraft_cos::Document, form: &[pdfcraft_forms::Field], edit: &Edit) -> Result<bool, EditError> {
+    let Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } = edit else {
+        return Ok(false);
+    };
+    match guard(|| pdfcraft_forms::set_simple_text_value(next, form, name, value)) {
+        Ok(result) => result.map_err(Into::into),
+        Err(message) => Err(EditError::Invalid(format!("{} failed unexpectedly ({message}); the document was not changed", edit.label()))),
+    }
+}
+
 impl Session {
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
@@ -68,20 +78,7 @@ impl Session {
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
         let simple_text_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
-            match &edit {
-                Edit::SetFieldValue { name, value: crate::FieldValue::Text(value) } => {
-                    match guard(|| pdfcraft_forms::set_simple_text_value(&mut next, &doc.form, name, value)) {
-                        Ok(result) => result?,
-                        Err(message) => {
-                            return Err(EditError::Invalid(format!(
-                                "{} failed unexpectedly ({message}); the document was not changed",
-                                edit.label()
-                            )));
-                        }
-                    }
-                }
-                _ => false,
-            }
+            try_simple_text_field_edit(&mut next, &doc.form, &edit)?
         } else {
             false
         };
