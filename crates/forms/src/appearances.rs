@@ -1,6 +1,6 @@
 use super::read::{acroform, fields};
 use super::values::merged_appearance;
-use super::{Dict, Document, FieldKind, ObjRef, Object, Widget, appearance, name_bytes};
+use super::{Dict, Document, Field, FieldKind, ObjRef, Object, Widget, appearance, name_bytes};
 
 /// Whether the form asks viewers to draw its fields' appearances themselves (`/NeedAppearances`).
 pub fn need_appearances(doc: &Document) -> bool {
@@ -99,6 +99,57 @@ pub fn with_field_appearances_cached(doc: &Document, cache: &mut FieldAppearance
         }
     }
     copy
+}
+
+/// Copy one already-redrawn, root-level text field into a display document from the same PDF
+/// revision. This lets an editor retain every other display-only appearance instead of rebuilding
+/// them after one field value changes. Returns false when the appearance refers to an object that
+/// is new or edited in `source`; callers should then rebuild the display copy normally.
+pub fn update_simple_text_field_display(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
+    let [widget] = field.widgets.as_slice() else { return false };
+    if field.kind != FieldKind::Text || field.obj != widget.obj {
+        return false;
+    }
+    let source_field = source.get(field.obj);
+    let Some(source_dict) = source_field.as_dict() else { return false };
+    if source_dict.reference(b"Parent").is_some() {
+        return false;
+    }
+    let value = source_dict.get(b"V").cloned();
+    if value.as_ref().is_some_and(|value| has_edited_reference(source, value)) {
+        return false;
+    }
+    let stream = appearance::field_appearance_drawn(source, field, widget, &field.value, true).0;
+    if stream.dict.iter().any(|(_, value)| has_edited_reference(source, value)) {
+        return false;
+    }
+    cache.insert(widget.obj, appearance_inputs(source, widget), &stream);
+
+    let appearance = display.add(Object::Stream(stream));
+    let mut fresh = Dict::new();
+    fresh.set(b"N".to_vec(), Object::Ref(appearance));
+    let ap = merged_appearance(display, widget.obj, &fresh);
+    display
+        .update_dict(field.obj, |dict| {
+            if let Some(value) = value {
+                dict.set(b"V".to_vec(), value);
+            } else {
+                dict.remove(b"V");
+            }
+            dict.remove(b"RV");
+            dict.set(b"AP".to_vec(), Object::Dict(ap));
+        })
+        .is_ok()
+}
+
+fn has_edited_reference(doc: &Document, object: &Object) -> bool {
+    match object {
+        Object::Ref(r) => doc.is_edited(r.num),
+        Object::Array(items) => items.iter().any(|item| has_edited_reference(doc, item)),
+        Object::Dict(dict) => dict.iter().any(|(_, item)| has_edited_reference(doc, item)),
+        Object::Stream(stream) => stream.dict.iter().any(|(_, item)| has_edited_reference(doc, item)),
+        _ => false,
+    }
 }
 
 /// The objects a widget's drawn appearance is built from, as the document holds them: the widget

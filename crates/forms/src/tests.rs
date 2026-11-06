@@ -3414,6 +3414,24 @@ fn the_field_appearance_cache_redraws_only_what_changed() {
     assert!(ap(&copy, &field(&fields(&copy), "a").widgets[0]).contains("(Value A) Tj"), "a reuses its drawing");
 }
 
+/// A session can append a changed text field to its previous display revision while preserving
+/// the display-only appearances it already drew for every other widget.
+#[test]
+fn a_text_field_display_update_reuses_the_other_widgets() {
+    let mut source = left_to_the_viewer(true);
+    let mut cache = FieldAppearanceCache::default();
+    let mut display = with_field_appearances_cached(&source, &mut cache).expect("fields to draw");
+    let old_a = ap(&display, &field(&fields(&display), "a").widgets[0]);
+
+    set_value(&mut source, "b", &FieldValue::Text("Typed".into())).unwrap();
+    let source_fields = fields(&source);
+    let changed = field(&source_fields, "b");
+    assert!(update_simple_text_field_display(&source, &mut display, &changed, &mut cache));
+
+    assert!(ap(&display, &field(&fields(&display), "b").widgets[0]).contains("(Typed) Tj"));
+    assert_eq!(ap(&display, &field(&fields(&display), "a").widgets[0]), old_a);
+}
+
 /// #3470: each kind of input a field's drawing depends on invalidates its cached appearance when
 /// it changes, wherever it lives: the parent field's value, the form's `/DA`, an indirect `/MK`
 /// and a `/DR` font. Field H is a parent with one kid widget; I is a plain field.

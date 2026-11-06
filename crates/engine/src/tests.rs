@@ -2587,6 +2587,37 @@ fn password_field_values_are_kept_in_memory_but_written_to_no_file() {
     assert!(t.get(reopened).unwrap().form.iter().find(|f| f.name == "name").unwrap().value.iter().all(|v| v.is_empty()));
 }
 
+#[test]
+fn plain_text_field_edits_update_only_the_display_revision_field() {
+    let mut session = Session::new().with_clock(|| 1_700_000_000);
+    let id = session.open("form.pdf", None, Arc::new(form_fixture()), None).unwrap();
+    let before = pdfcraft_cos::Document::open(session.get(id).unwrap().display.clone()).unwrap();
+    let before_ok = pdfcraft_forms::fields(&before).into_iter().find(|field| field.name == "ok").unwrap();
+    let before_ok_ap = before.get(before_ok.widgets[0].obj).as_dict().unwrap().get(b"AP").unwrap().clone();
+
+    session.apply(id, Edit::SetFieldValue { name: "name".into(), value: FieldValue::Text("Grace".into()) }).unwrap();
+    let current = session.get(id).unwrap();
+    let display = pdfcraft_cos::Document::open(current.display.clone()).unwrap();
+    let displayed_name = pdfcraft_forms::fields(&display).into_iter().find(|field| field.name == "name").unwrap();
+    let displayed_ok = pdfcraft_forms::fields(&display).into_iter().find(|field| field.name == "ok").unwrap();
+    assert_eq!(displayed_name.value, ["Grace"]);
+    assert!(displayed_name.widgets.iter().all(|widget| {
+        display
+            .get(widget.obj)
+            .as_dict()
+            .and_then(|dict| dict.get(b"AP"))
+            .and_then(|ap| display.resolve(ap).as_dict()?.get(b"N").cloned())
+            .and_then(|normal| match &*display.resolve(&normal) {
+                pdfcraft_cos::Object::Stream(stream) => stream.decoded_strict().ok(),
+                _ => None,
+            })
+            .is_some_and(|appearance| appearance.windows(5).any(|window| window == b"Grace"))
+    }));
+    assert_eq!(display.get(displayed_ok.widgets[0].obj).as_dict().unwrap().get(b"AP").unwrap(), &before_ok_ap);
+    assert_eq!(current.form.iter().find(|field| field.name == "name").unwrap().value, ["Grace"]);
+    assert_eq!(current.info.fields.iter().find(|field| field.name == "name").unwrap().value.as_deref(), Some("Grace"));
+}
+
 /// #3943 review: recording a save rebases editing on the saved file, which carries no Password
 /// value; the typed value stays in the open document all the same, and a later save still omits it.
 #[test]
