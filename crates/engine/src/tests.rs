@@ -2909,6 +2909,8 @@ fn form_edits_refresh_field_values_without_a_full_inspection() {
     let values = |fs: &[pdfcraft_render::Field]| fs.iter().map(|f| (f.name.clone(), f.value.clone())).collect::<Vec<_>>();
     assert_eq!(values(&d.info.fields), values(&full.fields));
     assert_eq!(values(&d.info.fields), [("name".to_string(), Some("Ada".to_string())), ("ok".to_string(), Some("Yes".to_string()))]);
+    let reopened = pdfcraft_cos::Document::open(d.bytes.clone()).unwrap();
+    assert_eq!(d.form.as_ref(), &pdfcraft_forms::fields(&reopened), "the targeted form cache must match a full form read");
 }
 
 #[test]

@@ -3472,6 +3472,26 @@ fn simple_field_update_matches_the_general_setter_for_hierarchy_buttons_and_choi
 }
 
 #[test]
+fn current_field_value_matches_a_full_read_for_nested_buttons_and_choices() {
+    for (name, value) in [
+        ("address.city", FieldValue::Text("".into())),
+        ("agree", FieldValue::Check(true)),
+        ("size", FieldValue::Radio(Some("L".into()))),
+        ("country", FieldValue::Choice(vec!["fr".into()])),
+        ("toppings", FieldValue::Choice(vec!["Cheese".into(), "Olives".into()])),
+    ] {
+        let mut doc = fixture();
+        let all = fields(&doc);
+        let before = field(&all, name).clone();
+        assert!(set_simple_field_value(&mut doc, &all, name, &value).unwrap(), "{name}");
+
+        let targeted = current_field_value(&doc, &before);
+        let complete = fields(&doc);
+        assert_eq!(targeted, *field(&complete, name), "targeted refresh must match a full read for {name}");
+    }
+}
+
+#[test]
 fn indexed_actionful_field_update_matches_the_general_setter_bytes() {
     use crate::af::{CalcOp, Calculate, Format, Validate};
 

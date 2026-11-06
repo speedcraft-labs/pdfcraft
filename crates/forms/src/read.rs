@@ -292,6 +292,40 @@ pub fn fields(doc: &Document) -> Vec<Field> {
     fields_with_adopted(doc).items
 }
 
+/// Refresh only the value and widget state of a field already read from this document.
+///
+/// This is for edits that are known not to run field scripts or change field metadata. It avoids
+/// walking the entire field tree and decoding every action just to update one cached value.
+pub fn current_field_value(doc: &Document, field: &Field) -> Field {
+    let mut updated = field.clone();
+    let mut current = Some(field.obj);
+    let mut seen = std::collections::HashSet::new();
+    let mut value = None;
+    while let Some(reference) = current.filter(|r| seen.insert(*r) && seen.len() <= 64) {
+        let object = doc.get(reference);
+        let Some(dict) = object.as_dict() else { break };
+        if let Some(v) = dict.get(b"V") {
+            value = Some(v.clone());
+            break;
+        }
+        current = dict.reference(b"Parent");
+    }
+    let mut budget = DecodeBudget::new(MAX_VALUE_BYTES, 0);
+    updated.value = value.as_ref().map(|v| values_of(doc, Some(v), &mut budget)).unwrap_or_default();
+
+    let field_dict = doc.get(field.obj);
+    let field_dict = field_dict.as_dict();
+    for widget in &mut updated.widgets {
+        let object = doc.get(widget.obj);
+        let Some(dict) = object.as_dict() else { continue };
+        widget.state = dict.name(b"AS").map(name_text);
+        if updated.kind == FieldKind::List {
+            widget.list = Some(appearance::list_rows_of(doc, &updated.da, field_dict, dict));
+        }
+    }
+    updated
+}
+
 /// How many of [`fields`] were reachable only through the page annotations: the form's `/Fields`
 /// list names none or only some of them, so the leniency that adopts them is worth recording.
 pub fn adopted_page_fields(doc: &Document) -> usize {

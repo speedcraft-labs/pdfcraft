@@ -97,6 +97,7 @@ impl Session {
         cx.renamed_fields.clear();
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
+        let mut simple_field_applied = false;
         let fast_field_applied = if !doc.info.encrypted && doc.info.xfa.is_none() && doc.signatures.is_empty() && !signed {
             let actionful = doc.form.iter().any(|field| {
                 !field.actions.is_empty()
@@ -112,7 +113,8 @@ impl Session {
                 }
                 try_indexed_field_edit(&mut next, &doc.form, &edit, cx.js.as_mut())?
             } else {
-                try_simple_field_edit(&mut next, &doc.form, &edit)?
+                simple_field_applied = try_simple_field_edit(&mut next, &doc.form, &edit)?;
+                simple_field_applied
             }
         } else {
             false
@@ -243,9 +245,14 @@ impl Session {
         }
         editor.redo.clear();
         Self::adopt_keys(doc);
-        let refreshed =
-            guard(|| if scope == Scope::Content { Self::refresh_content(doc, Some(&edit)) } else { Self::refresh_scoped(doc, scope, Some(&edit)) })
-                .unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| {
+            if scope == Scope::Content {
+                Self::refresh_content(doc, Some(&edit))
+            } else {
+                Self::refresh_scoped(doc, scope, Some(&edit), simple_field_applied)
+            }
+        })
+        .unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             // Roll back: the edit produced something we cannot display.
             if let Some(ed) = doc.editor.as_mut()
@@ -292,7 +299,7 @@ impl Session {
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.redo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.redo.pop()
@@ -321,7 +328,7 @@ impl Session {
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.undo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.undo.pop()
@@ -361,7 +368,14 @@ impl Session {
     /// keep the renderer; other scopes also replace it.
     /// Comment and form edits skip the full re-inspection (seconds on very large files): the
     /// comment list and field values are re-read from the object graph instead.
-    fn refresh_scoped(doc: &mut Document, scope: Scope, edit: Option<&Edit>) -> Result<(), EditError> {
+    fn refresh_scoped(doc: &mut Document, scope: Scope, edit: Option<&Edit>, simple_field_applied: bool) -> Result<(), EditError> {
+        if scope == Scope::Form
+            && let Some(edit) = edit
+            && simple_field_applied
+            && Self::refresh_simple_field_edit(doc, edit)?
+        {
+            return Ok(());
+        }
         if scope == Scope::Form
             && let Some(edit) = edit
             && Self::refresh_field_edit(doc, edit)?
@@ -453,6 +467,75 @@ impl Session {
         Ok(())
     }
 
+    /// The actionless setter can change only one field's value, so update its cached field and
+    /// appearance directly. Actionful edits keep the full field read below because scripts may
+    /// change other fields, flags, and widget visibility.
+    fn refresh_simple_field_edit(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
+        let Edit::SetFieldValue { name, .. } = edit else { return Ok(false) };
+        if doc.info.encrypted || doc.info.xfa.is_some() || !doc.signatures.is_empty() {
+            return Ok(false);
+        }
+        let mut matches = doc.form.iter().enumerate().filter(|(_, field)| field.name == *name);
+        let Some((index, old_field)) = matches.next() else { return Ok(false) };
+        if matches.next().is_some() {
+            return Ok(false);
+        }
+        let old_field = old_field.clone();
+        let updated = {
+            let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
+            pdfcraft_forms::current_field_value(&editor.cos, &old_field)
+        };
+        if old_field.value == updated.value && old_field.widgets.iter().zip(&updated.widgets).all(|(a, b)| a.state == b.state) {
+            return Ok(false);
+        }
+
+        let mut display = if Arc::ptr_eq(&doc.display, &doc.bytes) {
+            let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
+            editor.cos.clone()
+        } else {
+            match pdfcraft_cos::Document::open_with_password(doc.display.clone(), doc.password.as_deref()) {
+                Ok(display) => display,
+                Err(_) => return Ok(false),
+            }
+        };
+        {
+            let Some(editor) = doc.editor.as_mut() else { return Ok(false) };
+            if !pdfcraft_forms::update_field_display(&editor.cos, &mut display, &updated, &mut editor.field_appearances) {
+                return Ok(false);
+            }
+        }
+
+        Self::release_working(doc);
+        let Some(editor) = doc.editor.as_ref() else { return Ok(true) };
+        let bytes = if editor.cos.is_modified() {
+            Arc::new(write_incremental(&editor.cos, &SaveOptions::default()).map_err(|error| EditError::Write(error.to_string()))?)
+        } else {
+            editor.cos.bytes().clone()
+        };
+        let display = match write_incremental(&display, &SaveOptions::default()) {
+            Ok(display) => Arc::new(display),
+            Err(_) => return Ok(false),
+        };
+
+        if let Some(field) = Arc::make_mut(&mut doc.form).get_mut(index) {
+            *field = updated.clone();
+        }
+        if let Some(field) = doc.info.fields.iter_mut().find(|field| field.name == *name) {
+            field.value = match updated.kind {
+                pdfcraft_forms::FieldKind::CheckBox | pdfcraft_forms::FieldKind::Radio => {
+                    Some(updated.value.first().cloned().unwrap_or_else(|| "Off".into()))
+                }
+                _ if updated.value.is_empty() => None,
+                _ => Some(updated.value.join(", ")),
+            };
+        }
+        doc.info.file_size = bytes.len();
+        doc.display = display;
+        doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));
+        doc.bytes = bytes;
+        Ok(true)
+    }
+
     /// A field edit changes a small part of the form. Keep the existing display revision and
     /// replace the appearances for fields whose values changed, including calculation results.
     fn refresh_field_edit(doc: &mut Document, edit: &Edit) -> Result<bool, EditError> {
@@ -492,10 +575,18 @@ impl Session {
             return Ok(false);
         }
 
-        let old_display = doc.display.clone();
-        let mut display = match pdfcraft_cos::Document::open_with_password(old_display, doc.password.as_deref()) {
-            Ok(display) => display,
-            Err(_) => return Ok(false),
+        // When the display bytes are the source bytes, the editor graph already contains the
+        // updated field values. Clone that graph for the display-only appearance changes instead
+        // of reparsing the whole PDF on every form edit. Reopen the display copy only when opening
+        // the document had to add display-only appearances of its own.
+        let mut display = if Arc::ptr_eq(&doc.display, &doc.bytes) {
+            let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
+            editor.cos.clone()
+        } else {
+            match pdfcraft_cos::Document::open_with_password(doc.display.clone(), doc.password.as_deref()) {
+                Ok(display) => display,
+                Err(_) => return Ok(false),
+            }
         };
         {
             let Some(editor) = doc.editor.as_mut() else { return Ok(false) };
