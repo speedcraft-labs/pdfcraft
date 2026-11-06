@@ -1,5 +1,7 @@
 # PdfCraft roadmap
 
+> **Last reviewed:** 2026-11-06 · **Last updated:** 2026-11-06 · **Change:** minor (M14, #244 PdfCraft page-edit and AcroForm latency budgets; estimates unchanged)
+
 > **Last reviewed:** 2026-11-01 | **Last updated:** 2026-11-01 | **Change:** patch (M7, PR #2155 further review: inherited drawing/text state, affine image gestures, paste/selection ownership, no-op scripts and menu permissions; estimates unchanged)
 
 > **Last reviewed:** 2026-11-01 | **Last updated:** 2026-11-01 | **Change:** patch (M7, PR #2155 latest comments: explicit image-paste events, mixed-size field refresh, and documented mixed-script normalization with Undo; estimates unchanged)
@@ -218,6 +220,8 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 | 8 | 1.0 polish: performance, right-to-left, missing languages, keyboard-only (M14) | 55–95 |
 
 ## Progress log
+
+- **2026-11-06 (M14, #244):** The wired PdfCraft journeys now edit a 100,000-page synthetic file in 14.450 ms from a 1,683.158 ms baseline (new/old ratio 0.008585, 95% CI 0.008021–0.009215), and a 3,129-field form in 16.176 ms from 482.868 ms (ratio 0.033499, CI 0.031476–0.036787). Both outputs are hash-checked; fixtures are deterministic and synthetic. The form fast path applies only to one unique actionless root text field and preserves the general setter output byte-for-byte. Wider latency budgets remain; estimates unchanged.
 
 - **2026-11-01 (M7, #5657):** Header/footer, watermark and background additions and replacements stage the complete call before committing. Synthetic later-page failures preserve exact incremental bytes, object count, dirty state and allocation cursor; success controls retain other marks and shared/inherited resources. Estimates unchanged.
 
