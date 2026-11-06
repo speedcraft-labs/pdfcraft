@@ -29,11 +29,16 @@ pub fn check_pages(bytes: Arc<Vec<u8>>, password: Option<&str>, expected: usize)
     Ok(())
 }
 
-/// Check that the parser can open a new revision without walking the page tree. Content-only
-/// edits cannot change that tree, so traversing every page just to recount it needlessly makes an
-/// edit in a very large document O(page count).
+/// Check that the incremental revision's cross-reference chain and catalog can be read.
+/// Content-only edits leave the already-opened page tree unchanged, so reopening it through the
+/// renderer (which eagerly materializes every page) would make an edit O(page count).
 pub fn check_open(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<(), OpenError> {
-    open_for_check(bytes, password).map(drop)
+    pdfcraft_cos::Document::open_with_stream_limit(bytes, password, LOAD_STREAM_LIMIT).map(drop).map_err(|error| match error {
+        pdfcraft_cos::CosError::NeedsPassword => OpenError::NeedsPassword,
+        pdfcraft_cos::CosError::WrongPassword => OpenError::WrongPassword,
+        pdfcraft_cos::CosError::Security(detail) => OpenError::Unsupported(format!("encryption not supported: {detail}")),
+        other => OpenError::Invalid(format!("the incremental revision could not be reopened: {other}")),
+    })
 }
 
 fn open_for_check(bytes: Arc<Vec<u8>>, password: Option<&str>) -> Result<Pdf, OpenError> {

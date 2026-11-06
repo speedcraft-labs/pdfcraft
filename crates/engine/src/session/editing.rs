@@ -518,8 +518,8 @@ impl Session {
         } else {
             editor.cos.bytes().clone()
         };
-        // Content edits cannot change the page tree. Reopen the written revision to catch an
-        // invalid edit, but skip counting all pages because the writer preserves that tree.
+        // Validate the written xref chain and catalog without re-materializing the unchanged
+        // page tree: Hayro's constructor eagerly walks every page.
         pdfcraft_render::check_open(bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Reopen(e.to_string()))?;
         let (touches_added, touches_marks) = Self::content_refresh_lists(edit);
         if touches_added || touches_marks {
