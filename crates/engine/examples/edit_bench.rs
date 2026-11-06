@@ -186,7 +186,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 },
             )?;
         } else if let Some(name) = selected_field.as_ref() {
-            session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text(format!("value{}", run % 2)) })?;
+            session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
         } else {
             session.apply(id, Edit::SetFieldValue { name: "field0000".into(), value: FieldValue::Text(format!("value{}", run % 2)) })?;
         }
