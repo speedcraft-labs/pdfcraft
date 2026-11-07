@@ -1221,7 +1221,8 @@ impl<'a, 'b> Runner<'a, 'b> {
                     .calculations
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, calculation)| selected.contains(&index).then(|| calculation.event.clone()))
+                    .filter(|(index, _)| selected.contains(index))
+                    .map(|(_, calculation)| calculation.event.clone())
                     .collect();
                 return self.calculate_events(events);
             }

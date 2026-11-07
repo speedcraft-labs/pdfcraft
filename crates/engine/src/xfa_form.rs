@@ -80,7 +80,7 @@ impl XfaDatasetWarningCache {
     ) -> Option<Self> {
         // Packet-level warnings do not belong to one field, so leave those documents on the full
         // diagnostic path. Field warnings can be safely refreshed by object reference.
-        let Some(tpl) = tpl else { return None };
+        let tpl = tpl?;
         if pdfcraft_xfa::format_field_warnings(field_warnings) != write.warnings {
             return None;
         }
