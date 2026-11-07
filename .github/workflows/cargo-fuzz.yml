@@ -1,0 +1,91 @@
+name: Cargo Fuzz
+
+on:
+  schedule:
+    - cron: "53 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: [self-hosted, agentbox]
+    concurrency:
+      group: cargo-fuzz-${{ github.ref }}-${{ matrix.crate }}-${{ matrix.target }}
+      cancel-in-progress: true
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: filters
+            target: decode
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_TARGET_DIR: /jobs/work/speedcraft-labs/targets/fuzzers-200-pdfcraft
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: nice -n 19 cargo +nightly install cargo-fuzz --locked
+      - name: Set up persistent corpus
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          corpus="/jobs/work/speedcraft-labs/fuzz-corpus/pdfcraft/${{ matrix.crate }}/${{ matrix.target }}"
+          artifacts="$RUNNER_TEMP/fuzz-artifacts/pdfcraft-${{ matrix.crate }}-${{ matrix.target }}"
+          mkdir -p "$corpus" "$artifacts"
+          if [ "${{ matrix.crate }}" = filters ] && [ -z "$(find "$corpus" -type f -print -quit)" ]; then
+            python3 - "$corpus" <<'PY'
+          from pathlib import Path
+          import shutil, sys
+          root = Path('/jobs/work/speedcraft-labs/hyper/corpus')
+          dest = Path(sys.argv[1])
+          count = 0
+          if root.is_dir():
+              for seed in root.rglob('*'):
+                  if seed.is_file() and seed.suffix.lower() == '.pdf' and seed.stat().st_size <= 4 * 1024 * 1024:
+                      shutil.copy2(seed, dest / seed.name)
+                      count += 1
+                      if count == 12:
+                          break
+          PY
+          fi
+          echo "corpus=$corpus" >> "$GITHUB_OUTPUT"
+          echo "artifacts=$artifacts" >> "$GITHUB_OUTPUT"
+      - name: Fuzz (10 minute target budget)
+        id: fuzz
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          cd "crates/${{ matrix.crate }}"
+          mkdir -p "${{ steps.paths.outputs.artifacts }}/minimized"
+          nice -n 19 cargo +nightly fuzz run "${{ matrix.target }}" "${{ steps.paths.outputs.corpus }}" -- \
+            -max_len=4194304 -max_total_time=600 \
+            -artifact_prefix="${{ steps.paths.outputs.artifacts }}/"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Minimize crash reproducers and corpus
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cd "crates/${{ matrix.crate }}"
+          while IFS= read -r -d '' crash; do
+            nice -n 19 cargo +nightly fuzz tmin "${{ matrix.target }}" "$crash" -- -max_total_time=60 -artifact_prefix="${{ steps.paths.outputs.artifacts }}/minimized/"
+          done < <(find "${{ steps.paths.outputs.artifacts }}" -type f -name 'crash-*' -print0)
+          nice -n 19 cargo +nightly fuzz cmin "${{ matrix.target }}" "${{ steps.paths.outputs.corpus }}" -- -max_total_time=60
+      - name: Upload crash reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-pdfcraft-${{ matrix.crate }}-${{ matrix.target }}
+          path: ${{ steps.paths.outputs.artifacts }}
+          if-no-files-found: ignore
+      - name: Fail when fuzzing found a crash
+        if: steps.fuzz.outputs.exit_code != '0'
+        run: exit 1
