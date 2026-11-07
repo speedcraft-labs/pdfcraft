@@ -1,0 +1,1549 @@
+{
+  "schema_version": 1,
+  "name": "pdfcraft redaction multi-pattern search",
+  "revs": {
+    "old": "9f7dc3d7f36d1f9d70cc0a7a006991171b1b136d",
+    "new": "e4c61cd603c2c6469c4c67d799cd075b5e86375c"
+  },
+  "fingerprint": {
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "Linux 6.12.115+deb13.1-cloud-amd64",
+    "cpu_model": "AMD Ryzen 9 5900XT 16-Core Processor",
+    "logical_cores": 6,
+    "isolation_mode": true,
+    "allowed_cpu_list": "22-27",
+    "physical_cores": 28,
+    "ram_bytes": 92724637696,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "opt_level": "3",
+    "debug_assertions": false,
+    "date": "2026-11-07T21:53:15+00:00"
+  },
+  "config": {
+    "requested_repetitions": 10,
+    "runs_per_side": 10,
+    "warmup_runs": 2,
+    "resamples": 2000,
+    "seed": 12648430,
+    "output_checked": true,
+    "cpu_time": "process"
+  },
+  "guard": {
+    "contended": false,
+    "reasons": [],
+    "load_before": 1.0797029702970298,
+    "load_after": 1.1686196854979616,
+    "logical_cores": 6,
+    "max_load_per_core": 0.5,
+    "load_threshold": 3.0,
+    "throttle_before": {
+      "speed_limit_pct": null,
+      "throttle_count": null
+    },
+    "throttle_after": {
+      "speed_limit_pct": null,
+      "throttle_count": null
+    }
+  },
+  "contended": false,
+  "publishable": true,
+  "inputs": [
+    {
+      "name": "opm-sf85p-page-0",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 2492939.5,
+          "mad_ns": 29069.5,
+          "min_ns": 2306551.0,
+          "max_ns": 2580680.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 548788.5,
+          "mad_ns": 15740.5,
+          "min_ns": 502931.0,
+          "max_ns": 581529.0
+        },
+        "ratio": {
+          "point": 0.22013711122953444,
+          "ci_lo": 0.21348712404520692,
+          "ci_hi": 0.230138776833836
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 2496907.5,
+          "mad_ns": 29710.5,
+          "min_ns": 2308810.0,
+          "max_ns": 2587512.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 551248.5,
+          "mad_ns": 16255.5,
+          "min_ns": 504867.0,
+          "max_ns": 583775.0
+        },
+        "ratio": {
+          "point": 0.22077249557702877,
+          "ci_lo": 0.214559009494745,
+          "ci_hi": 0.2309235728848733
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-1",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 2246552.5,
+          "mad_ns": 42956.0,
+          "min_ns": 2100853.0,
+          "max_ns": 2375753.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 505009.5,
+          "mad_ns": 42419.5,
+          "min_ns": 435203.0,
+          "max_ns": 560751.0
+        },
+        "ratio": {
+          "point": 0.22479309964935162,
+          "ci_lo": 0.19821125925167563,
+          "ci_hi": 0.2431895019142892
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 2249188.0,
+          "mad_ns": 43417.0,
+          "min_ns": 2104977.0,
+          "max_ns": 2378972.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 506955.5,
+          "mad_ns": 43060.5,
+          "min_ns": 436800.0,
+          "max_ns": 563156.0
+        },
+        "ratio": {
+          "point": 0.22539489806988122,
+          "ci_lo": 0.19915951903040063,
+          "ci_hi": 0.24375740205762514
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-2",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 1951855.5,
+          "mad_ns": 28174.0,
+          "min_ns": 1868604.0,
+          "max_ns": 2111824.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 452365.5,
+          "mad_ns": 8916.0,
+          "min_ns": 405216.0,
+          "max_ns": 464790.0
+        },
+        "ratio": {
+          "point": 0.2317617774471522,
+          "ci_lo": 0.2220564306983659,
+          "ci_hi": 0.2382592407617643
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 1954326.0,
+          "mad_ns": 28469.0,
+          "min_ns": 1872031.0,
+          "max_ns": 2115809.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 454578.0,
+          "mad_ns": 9477.5,
+          "min_ns": 407083.0,
+          "max_ns": 466835.0
+        },
+        "ratio": {
+          "point": 0.23260090691112947,
+          "ci_lo": 0.2227775007443147,
+          "ci_hi": 0.23938632607736152
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-3",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 926251.0,
+          "mad_ns": 26240.0,
+          "min_ns": 867820.0,
+          "max_ns": 991023.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 234503.5,
+          "mad_ns": 6767.5,
+          "min_ns": 211811.0,
+          "max_ns": 258159.0
+        },
+        "ratio": {
+          "point": 0.2531748953577378,
+          "ci_lo": 0.23946892936521186,
+          "ci_hi": 0.2629471519755788
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 928601.5,
+          "mad_ns": 26419.5,
+          "min_ns": 869761.0,
+          "max_ns": 993993.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 236414.0,
+          "mad_ns": 6748.0,
+          "min_ns": 213971.0,
+          "max_ns": 260279.0
+        },
+        "ratio": {
+          "point": 0.2545914474615861,
+          "ci_lo": 0.24048267001458606,
+          "ci_hi": 0.26343966365823707
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-4",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 741001.5,
+          "mad_ns": 56391.5,
+          "min_ns": 636493.0,
+          "max_ns": 825701.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 191647.0,
+          "mad_ns": 8641.5,
+          "min_ns": 175412.0,
+          "max_ns": 227339.0
+        },
+        "ratio": {
+          "point": 0.2586324049276553,
+          "ci_lo": 0.24450305132484873,
+          "ci_hi": 0.2950629083228021
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 743599.5,
+          "mad_ns": 56275.5,
+          "min_ns": 637986.0,
+          "max_ns": 829224.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 193262.5,
+          "mad_ns": 8871.5,
+          "min_ns": 177142.0,
+          "max_ns": 229420.0
+        },
+        "ratio": {
+          "point": 0.25990133129460147,
+          "ci_lo": 0.2458742943969166,
+          "ci_hi": 0.2964726057116833
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-5",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 735677.0,
+          "mad_ns": 4999.0,
+          "min_ns": 666460.0,
+          "max_ns": 753345.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 198309.5,
+          "mad_ns": 3301.5,
+          "min_ns": 187675.0,
+          "max_ns": 222922.0
+        },
+        "ratio": {
+          "point": 0.2695605544280982,
+          "ci_lo": 0.26542150971146306,
+          "ci_hi": 0.27804416858442316
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 737764.0,
+          "mad_ns": 5019.5,
+          "min_ns": 667933.0,
+          "max_ns": 755136.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 200180.5,
+          "mad_ns": 3396.5,
+          "min_ns": 189285.0,
+          "max_ns": 224982.0
+        },
+        "ratio": {
+          "point": 0.2713340580456623,
+          "ci_lo": 0.26867635393203626,
+          "ci_hi": 0.28012187910349395
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-6",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 761250.0,
+          "mad_ns": 20478.5,
+          "min_ns": 648917.0,
+          "max_ns": 793071.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 204321.0,
+          "mad_ns": 7869.5,
+          "min_ns": 192464.0,
+          "max_ns": 220867.0
+        },
+        "ratio": {
+          "point": 0.26840197044334974,
+          "ci_lo": 0.25241742085227903,
+          "ci_hi": 0.279250628170031
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 763577.0,
+          "mad_ns": 19902.0,
+          "min_ns": 650480.0,
+          "max_ns": 795121.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 206146.5,
+          "mad_ns": 8120.5,
+          "min_ns": 194234.0,
+          "max_ns": 222889.0
+        },
+        "ratio": {
+          "point": 0.2699747373218418,
+          "ci_lo": 0.25277150541408877,
+          "ci_hi": 0.28077263211147635
+        }
+      }
+    },
+    {
+      "name": "opm-sf85p-page-7",
+      "wall": {
+        "old": {
+          "n": 10,
+          "median_ns": 766124.0,
+          "mad_ns": 17539.0,
+          "min_ns": 662072.0,
+          "max_ns": 802328.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 202156.5,
+          "mad_ns": 7799.5,
+          "min_ns": 179688.0,
+          "max_ns": 231158.0
+        },
+        "ratio": {
+          "point": 0.2638691647827245,
+          "ci_lo": 0.2495010111827636,
+          "ci_hi": 0.2818862320037475
+        }
+      },
+      "cpu": {
+        "old": {
+          "n": 10,
+          "median_ns": 768466.5,
+          "mad_ns": 17397.5,
+          "min_ns": 664155.0,
+          "max_ns": 804248.0
+        },
+        "new": {
+          "n": 10,
+          "median_ns": 203922.5,
+          "mad_ns": 7880.0,
+          "min_ns": 181320.0,
+          "max_ns": 233297.0
+        },
+        "ratio": {
+          "point": 0.26536290131059714,
+          "ci_lo": 0.25059695072162136,
+          "ci_hi": 0.28574325908805703
+        }
+      }
+    }
+  ],
+  "aggregate": {
+    "inputs": 8,
+    "wall": {
+      "point": 0.24805988558241682,
+      "ci_lo": 0.24281295758389254,
+      "ci_hi": 0.25437871822342717
+    },
+    "cpu": {
+      "point": 0.24923128193924346,
+      "ci_lo": 0.24384508501658345,
+      "ci_hi": 0.25536875143354293
+    }
+  },
+  "runs": [
+    {
+      "order": 0,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2580680,
+      "cpu_ns": 2587512
+    },
+    {
+      "order": 1,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 581529,
+      "cpu_ns": 583775
+    },
+    {
+      "order": 2,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 532217,
+      "cpu_ns": 534252
+    },
+    {
+      "order": 3,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2413002,
+      "cpu_ns": 2415781
+    },
+    {
+      "order": 4,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 231158,
+      "cpu_ns": 233297
+    },
+    {
+      "order": 5,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 769504,
+      "cpu_ns": 771556
+    },
+    {
+      "order": 6,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 738626,
+      "cpu_ns": 740880
+    },
+    {
+      "order": 7,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 207943,
+      "cpu_ns": 209723
+    },
+    {
+      "order": 8,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2556684,
+      "cpu_ns": 2560552
+    },
+    {
+      "order": 9,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 579946,
+      "cpu_ns": 582172
+    },
+    {
+      "order": 10,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 549640,
+      "cpu_ns": 552105
+    },
+    {
+      "order": 11,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2522109,
+      "cpu_ns": 2526518
+    },
+    {
+      "order": 12,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1934478,
+      "cpu_ns": 1938255
+    },
+    {
+      "order": 13,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 460500,
+      "cpu_ns": 463550
+    },
+    {
+      "order": 14,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 435474,
+      "cpu_ns": 437691
+    },
+    {
+      "order": 15,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1959324,
+      "cpu_ns": 1961429
+    },
+    {
+      "order": 16,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 214025,
+      "cpu_ns": 215624
+    },
+    {
+      "order": 17,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 662072,
+      "cpu_ns": 664155
+    },
+    {
+      "order": 18,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 677451,
+      "cpu_ns": 679143
+    },
+    {
+      "order": 19,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 179688,
+      "cpu_ns": 181320
+    },
+    {
+      "order": 20,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 175412,
+      "cpu_ns": 177142
+    },
+    {
+      "order": 21,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 636493,
+      "cpu_ns": 637986
+    },
+    {
+      "order": 22,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 662313,
+      "cpu_ns": 663825
+    },
+    {
+      "order": 23,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 187615,
+      "cpu_ns": 189145
+    },
+    {
+      "order": 24,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 192464,
+      "cpu_ns": 194234
+    },
+    {
+      "order": 25,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 742585,
+      "cpu_ns": 745218
+    },
+    {
+      "order": 26,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 742373,
+      "cpu_ns": 745107
+    },
+    {
+      "order": 27,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 220867,
+      "cpu_ns": 222889
+    },
+    {
+      "order": 28,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 196932,
+      "cpu_ns": 198723
+    },
+    {
+      "order": 29,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 753345,
+      "cpu_ns": 755136
+    },
+    {
+      "order": 30,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 707858,
+      "cpu_ns": 710091
+    },
+    {
+      "order": 31,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 222922,
+      "cpu_ns": 224982
+    },
+    {
+      "order": 32,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 955596,
+      "cpu_ns": 957656
+    },
+    {
+      "order": 33,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 228092,
+      "cpu_ns": 230072
+    },
+    {
+      "order": 34,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 224515,
+      "cpu_ns": 226295
+    },
+    {
+      "order": 35,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 920280,
+      "cpu_ns": 922790
+    },
+    {
+      "order": 36,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2521077,
+      "cpu_ns": 2524194
+    },
+    {
+      "order": 37,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 546494,
+      "cpu_ns": 548949
+    },
+    {
+      "order": 38,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 502931,
+      "cpu_ns": 504867
+    },
+    {
+      "order": 39,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2306551,
+      "cpu_ns": 2308810
+    },
+    {
+      "order": 40,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 793071,
+      "cpu_ns": 795121
+    },
+    {
+      "order": 41,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 220556,
+      "cpu_ns": 222426
+    },
+    {
+      "order": 42,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 206450,
+      "cpu_ns": 208050
+    },
+    {
+      "order": 43,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 787400,
+      "cpu_ns": 789271
+    },
+    {
+      "order": 44,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 204557,
+      "cpu_ns": 206297
+    },
+    {
+      "order": 45,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 781869,
+      "cpu_ns": 783539
+    },
+    {
+      "order": 46,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 781588,
+      "cpu_ns": 783419
+    },
+    {
+      "order": 47,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 205400,
+      "cpu_ns": 207139
+    },
+    {
+      "order": 48,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 198255,
+      "cpu_ns": 199965
+    },
+    {
+      "order": 49,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 737734,
+      "cpu_ns": 740018
+    },
+    {
+      "order": 50,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 736133,
+      "cpu_ns": 738355
+    },
+    {
+      "order": 51,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 199918,
+      "cpu_ns": 201889
+    },
+    {
+      "order": 52,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 949386,
+      "cpu_ns": 952386
+    },
+    {
+      "order": 53,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 235816,
+      "cpu_ns": 237797
+    },
+    {
+      "order": 54,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 227380,
+      "cpu_ns": 229260
+    },
+    {
+      "order": 55,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 932222,
+      "cpu_ns": 934413
+    },
+    {
+      "order": 56,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 778102,
+      "cpu_ns": 780754
+    },
+    {
+      "order": 57,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 204085,
+      "cpu_ns": 205996
+    },
+    {
+      "order": 58,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 198786,
+      "cpu_ns": 200436
+    },
+    {
+      "order": 59,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 744398,
+      "cpu_ns": 746400
+    },
+    {
+      "order": 60,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 533879,
+      "cpu_ns": 535734
+    },
+    {
+      "order": 61,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2467286,
+      "cpu_ns": 2471034
+    },
+    {
+      "order": 62,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2463970,
+      "cpu_ns": 2467097
+    },
+    {
+      "order": 63,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 553827,
+      "cpu_ns": 556284
+    },
+    {
+      "order": 64,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 560751,
+      "cpu_ns": 563156
+    },
+    {
+      "order": 65,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2315719,
+      "cpu_ns": 2319140
+    },
+    {
+      "order": 66,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2228774,
+      "cpu_ns": 2232397
+    },
+    {
+      "order": 67,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 468346,
+      "cpu_ns": 470192
+    },
+    {
+      "order": 68,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 445062,
+      "cpu_ns": 446677
+    },
+    {
+      "order": 69,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2273579,
+      "cpu_ns": 2276420
+    },
+    {
+      "order": 70,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2375753,
+      "cpu_ns": 2378972
+    },
+    {
+      "order": 71,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 525022,
+      "cpu_ns": 527228
+    },
+    {
+      "order": 72,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 464790,
+      "cpu_ns": 466835
+    },
+    {
+      "order": 73,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1921222,
+      "cpu_ns": 1923928
+    },
+    {
+      "order": 74,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1944387,
+      "cpu_ns": 1947223
+    },
+    {
+      "order": 75,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 451063,
+      "cpu_ns": 453410
+    },
+    {
+      "order": 76,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 553185,
+      "cpu_ns": 556313
+    },
+    {
+      "order": 77,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2242410,
+      "cpu_ns": 2245381
+    },
+    {
+      "order": 78,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2100853,
+      "cpu_ns": 2104977
+    },
+    {
+      "order": 79,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 540412,
+      "cpu_ns": 543429
+    },
+    {
+      "order": 80,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 991023,
+      "cpu_ns": 993993
+    },
+    {
+      "order": 81,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 247669,
+      "cpu_ns": 250009
+    },
+    {
+      "order": 82,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 238020,
+      "cpu_ns": 240270
+    },
+    {
+      "order": 83,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 984341,
+      "cpu_ns": 987061
+    },
+    {
+      "order": 84,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 258159,
+      "cpu_ns": 260279
+    },
+    {
+      "order": 85,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 891005,
+      "cpu_ns": 893115
+    },
+    {
+      "order": 86,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 911022,
+      "cpu_ns": 913143
+    },
+    {
+      "order": 87,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 233191,
+      "cpu_ns": 235031
+    },
+    {
+      "order": 88,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2251788,
+      "cpu_ns": 2256552
+    },
+    {
+      "order": 89,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 445292,
+      "cpu_ns": 447189
+    },
+    {
+      "order": 90,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 435203,
+      "cpu_ns": 436800
+    },
+    {
+      "order": 91,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2187667,
+      "cpu_ns": 2189586
+    },
+    {
+      "order": 92,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 526736,
+      "cpu_ns": 528661
+    },
+    {
+      "order": 93,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2162458,
+      "cpu_ns": 2165791
+    },
+    {
+      "order": 94,
+      "input": "opm-sf85p-page-1",
+      "side": "old",
+      "wall_ns": 2250695,
+      "cpu_ns": 2252995
+    },
+    {
+      "order": 95,
+      "input": "opm-sf85p-page-1",
+      "side": "new",
+      "wall_ns": 484997,
+      "cpu_ns": 486683
+    },
+    {
+      "order": 96,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 730381,
+      "cpu_ns": 732183
+    },
+    {
+      "order": 97,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 194117,
+      "cpu_ns": 195546
+    },
+    {
+      "order": 98,
+      "input": "opm-sf85p-page-6",
+      "side": "new",
+      "wall_ns": 194027,
+      "cpu_ns": 195616
+    },
+    {
+      "order": 99,
+      "input": "opm-sf85p-page-6",
+      "side": "old",
+      "wall_ns": 648917,
+      "cpu_ns": 650480
+    },
+    {
+      "order": 100,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 668072,
+      "cpu_ns": 670247
+    },
+    {
+      "order": 101,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 197713,
+      "cpu_ns": 199855
+    },
+    {
+      "order": 102,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 193135,
+      "cpu_ns": 194775
+    },
+    {
+      "order": 103,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 750680,
+      "cpu_ns": 754084
+    },
+    {
+      "order": 104,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 459660,
+      "cpu_ns": 462488
+    },
+    {
+      "order": 105,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 2096756,
+      "cpu_ns": 2100069
+    },
+    {
+      "order": 106,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1972710,
+      "cpu_ns": 1975585
+    },
+    {
+      "order": 107,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 453668,
+      "cpu_ns": 455746
+    },
+    {
+      "order": 108,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 736462,
+      "cpu_ns": 738455
+    },
+    {
+      "order": 109,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 198065,
+      "cpu_ns": 199955
+    },
+    {
+      "order": 110,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 192464,
+      "cpu_ns": 194454
+    },
+    {
+      "order": 111,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 735221,
+      "cpu_ns": 737173
+    },
+    {
+      "order": 112,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 236236,
+      "cpu_ns": 238037
+    },
+    {
+      "order": 113,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 912335,
+      "cpu_ns": 914305
+    },
+    {
+      "order": 114,
+      "input": "opm-sf85p-page-3",
+      "side": "old",
+      "wall_ns": 867820,
+      "cpu_ns": 869761
+    },
+    {
+      "order": 115,
+      "input": "opm-sf85p-page-3",
+      "side": "new",
+      "wall_ns": 211811,
+      "cpu_ns": 213971
+    },
+    {
+      "order": 116,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 754598,
+      "cpu_ns": 756388
+    },
+    {
+      "order": 117,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 202864,
+      "cpu_ns": 204413
+    },
+    {
+      "order": 118,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 190159,
+      "cpu_ns": 191750
+    },
+    {
+      "order": 119,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 788992,
+      "cpu_ns": 790523
+    },
+    {
+      "order": 120,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 802328,
+      "cpu_ns": 804248
+    },
+    {
+      "order": 121,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 197003,
+      "cpu_ns": 198893
+    },
+    {
+      "order": 122,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 185010,
+      "cpu_ns": 186539
+    },
+    {
+      "order": 123,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 768834,
+      "cpu_ns": 771537
+    },
+    {
+      "order": 124,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 763414,
+      "cpu_ns": 765396
+    },
+    {
+      "order": 125,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 208474,
+      "cpu_ns": 210335
+    },
+    {
+      "order": 126,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 203173,
+      "cpu_ns": 204964
+    },
+    {
+      "order": 127,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 774675,
+      "cpu_ns": 776446
+    },
+    {
+      "order": 128,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 780807,
+      "cpu_ns": 782888
+    },
+    {
+      "order": 129,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 201140,
+      "cpu_ns": 202881
+    },
+    {
+      "order": 130,
+      "input": "opm-sf85p-page-7",
+      "side": "new",
+      "wall_ns": 192875,
+      "cpu_ns": 194575
+    },
+    {
+      "order": 131,
+      "input": "opm-sf85p-page-7",
+      "side": "old",
+      "wall_ns": 745729,
+      "cpu_ns": 748093
+    },
+    {
+      "order": 132,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 766880,
+      "cpu_ns": 769023
+    },
+    {
+      "order": 133,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 187394,
+      "cpu_ns": 189024
+    },
+    {
+      "order": 134,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 177226,
+      "cpu_ns": 178735
+    },
+    {
+      "order": 135,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 676209,
+      "cpu_ns": 677972
+    },
+    {
+      "order": 136,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 666460,
+      "cpu_ns": 667933
+    },
+    {
+      "order": 137,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 187675,
+      "cpu_ns": 189285
+    },
+    {
+      "order": 138,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 205288,
+      "cpu_ns": 207058
+    },
+    {
+      "order": 139,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 733407,
+      "cpu_ns": 735349
+    },
+    {
+      "order": 140,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 203304,
+      "cpu_ns": 205265
+    },
+    {
+      "order": 141,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 743405,
+      "cpu_ns": 745388
+    },
+    {
+      "order": 142,
+      "input": "opm-sf85p-page-5",
+      "side": "old",
+      "wall_ns": 721424,
+      "cpu_ns": 723356
+    },
+    {
+      "order": 143,
+      "input": "opm-sf85p-page-5",
+      "side": "new",
+      "wall_ns": 198364,
+      "cpu_ns": 200396
+    },
+    {
+      "order": 144,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 462063,
+      "cpu_ns": 464561
+    },
+    {
+      "order": 145,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1909000,
+      "cpu_ns": 1911855
+    },
+    {
+      "order": 146,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1977570,
+      "cpu_ns": 1980866
+    },
+    {
+      "order": 147,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 450883,
+      "cpu_ns": 452790
+    },
+    {
+      "order": 148,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 1868604,
+      "cpu_ns": 1872031
+    },
+    {
+      "order": 149,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 405216,
+      "cpu_ns": 407083
+    },
+    {
+      "order": 150,
+      "input": "opm-sf85p-page-2",
+      "side": "new",
+      "wall_ns": 435434,
+      "cpu_ns": 437581
+    },
+    {
+      "order": 151,
+      "input": "opm-sf85p-page-2",
+      "side": "old",
+      "wall_ns": 2111824,
+      "cpu_ns": 2115809
+    },
+    {
+      "order": 152,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 825701,
+      "cpu_ns": 829224
+    },
+    {
+      "order": 153,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 227339,
+      "cpu_ns": 229420
+    },
+    {
+      "order": 154,
+      "input": "opm-sf85p-page-4",
+      "side": "new",
+      "wall_ns": 204436,
+      "cpu_ns": 206467
+    },
+    {
+      "order": 155,
+      "input": "opm-sf85p-page-4",
+      "side": "old",
+      "wall_ns": 731323,
+      "cpu_ns": 733115
+    },
+    {
+      "order": 156,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 567825,
+      "cpu_ns": 570620
+    },
+    {
+      "order": 157,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2518563,
+      "cpu_ns": 2522781
+    },
+    {
+      "order": 158,
+      "input": "opm-sf85p-page-0",
+      "side": "old",
+      "wall_ns": 2467316,
+      "cpu_ns": 2470885
+    },
+    {
+      "order": 159,
+      "input": "opm-sf85p-page-0",
+      "side": "new",
+      "wall_ns": 547937,
+      "cpu_ns": 550392
+    }
+  ]
+}
