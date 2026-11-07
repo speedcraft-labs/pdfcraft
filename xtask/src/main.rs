@@ -40,10 +40,14 @@ const COMMANDS: &[(&str, &str, Command)] = &[
         "Report macOS bundle, Quick Look, Spotlight and PDF integration diagnostics without mutating system state",
         macos_integration::run,
     ),
-    ("text-oracle", "Compare text extraction with pdftotext over corpus/ (word F1; target median ≥ 0.97)", gates::text_oracle),
+    (
+        "text-oracle",
+        "Compare text extraction with pdftotext (per-file JSON scores; --dir, --baseline, --json, --update-baseline)",
+        gates::text_oracle,
+    ),
     (
         "render-oracle",
-        "Compare page rendering with Poppler over corpus/ (pixel disagreement rate; --dir, --dpi, --limit, --tolerance, --hide-annotations)",
+        "Compare page rendering with Poppler (per-file JSON scores and optional regression baseline; --dir, --dpi, --limit, --tolerance, --hide-annotations, --baseline, --json, --update-baseline)",
         gates::render_oracle,
     ),
     ("screenshots", "Regenerate the README screenshots in docs/images/ and their ATTRIBUTION entries", screenshots::run),

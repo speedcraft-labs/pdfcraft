@@ -245,49 +245,63 @@ pub fn check(args: &[String]) -> anyhow::Result<()> {
 /// Two scores per file, because one hides the other. **Word F1** ([`f1`]) is a bag of words: it
 /// catches a character read wrong, a glyph not read at all, a font we cannot map, and is blind to
 /// order. **Reading order** ([`order_score`]) catches what F1 cannot see — a column read into the
-/// middle of its neighbour, a figure's labels threaded through a paragraph. Reports both; gates
-/// neither. Plan target (M2): median F1 ≥ 0.97.
+/// middle of its neighbour, a figure's labels threaded through a paragraph. Without a baseline,
+/// this reports only; with `--baseline`, it fails when a stored score regresses past the comparison
+/// tolerance or a previously scored file stops producing a comparable result. Plan target (M2):
+/// median F1 ≥ 0.97.
 pub fn text_oracle(args: &[String]) -> anyhow::Result<()> {
     let limit: usize = args.iter().position(|a| a == "--limit").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    let corpus_dir =
+        args.iter().position(|a| a == "--dir").and_then(|i| args.get(i + 1)).map_or_else(|| root().join("corpus/pdfjs/test/pdfs"), PathBuf::from);
+    let json_out = args.iter().position(|a| a == "--json").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let baseline_path = args.iter().position(|a| a == "--baseline").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let update_baseline = args.iter().any(|a| a == "--update-baseline");
     let pdftotext = match pdfcraft_oracle::pdftotext() {
         Ok(o) => o,
         Err(absent) => bail!("{absent}"),
     };
     run_args(&["build", "--release", "-p", "pdfcraft-cli"])?;
-    let corpus = root().join("corpus/pdfjs/test/pdfs");
+    let corpus = corpus_dir;
     let mut files: Vec<PathBuf> =
         std::fs::read_dir(&corpus)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "pdf")).collect();
     files.sort();
     let cli = release_cli();
     let mut scores = Vec::new();
     let mut orders = Vec::new();
+    let mut per_file = BTreeMap::new();
     let mut worst: Vec<(f64, String)> = Vec::new();
     let mut worst_order: Vec<(f64, String)> = Vec::new();
     let mut not_permitted = 0usize;
     let mut truncated = 0usize;
     for f in files.iter().take(limit) {
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         // A document may forbid copying its text, and we honour that: `pdfcraft-cli text` refuses
         // and says how to override it with the owner password. pdftotext ignores the flag and
         // extracts anyway, so scoring us against it there measures obedience, not quality --
         // bug1815476.pdf scored 0.000 for behaving correctly on a page we render perfectly.
         if !copying_allowed(f) {
             not_permitted = not_permitted.saturating_add(1);
+            per_file.insert(name, serde_json::json!({"status": "copy-forbidden"}));
             continue;
         }
         let ours = run_capture(Command::new(&cli).arg("text").arg(f), 20);
         let theirs = run_capture(pdftotext.command().arg("-q").arg(f).arg("-"), 20);
-        let (Some(ours), Some(theirs)) = (ours, theirs) else { continue };
+        let (Some(ours), Some(theirs)) = (ours, theirs) else {
+            per_file.insert(name, serde_json::json!({"status": "extract-unavailable"}));
+            continue;
+        };
         let (sa, sb) = (word_sequence(&ours), word_sequence(&theirs));
         let (a, b) = (words(&sa), words(&sb));
         if b.len() < 20 {
+            per_file.insert(name, serde_json::json!({"status": "insufficient-reference-text"}));
             continue; // image-only or near-empty per the oracle
         }
         let score = f1(&a, &b);
         let (order, cut) = order_score(&sa, &sb);
         truncated = truncated.saturating_add(usize::from(cut));
-        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         scores.push(score);
         orders.push(order);
+        per_file.insert(name.clone(), serde_json::json!({"status": "scored", "f1": score, "reading_order": order}));
         worst.push((score, name.clone()));
         worst_order.push((order, name));
     }
@@ -320,15 +334,57 @@ pub fn text_oracle(args: &[String]) -> anyhow::Result<()> {
     for (s, n) in worst_order.iter().take(12) {
         println!("  {s:.3}  {n}");
     }
+    if let Some(path) = json_out {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&serde_json::json!({"schema": 1, "files": per_file.clone()}))?)?;
+    }
+    if let Some(path) = baseline_path {
+        if update_baseline {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, serde_json::to_vec_pretty(&serde_json::json!({"schema": 1, "files": per_file.clone()}))?)?;
+            println!("text oracle baseline updated: {} files", per_file.len());
+        } else {
+            let baseline: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("reading baseline {}", path.display()))?)?;
+            let old = baseline["files"].as_object().context("text oracle baseline has no files object")?;
+            let mut regressions = Vec::new();
+            for name in old.keys().filter(|name| !per_file.contains_key(*name)) {
+                regressions.push(format!("{name}: no comparable score (missing or unreadable input)"));
+            }
+            for (name, now) in &per_file {
+                if let Some(before) = old.get(name) {
+                    for metric in ["f1", "reading_order"] {
+                        match (now[metric].as_f64(), before[metric].as_f64()) {
+                            (Some(now_score), Some(before_score)) if now_score + 0.005 < before_score => {
+                                regressions.push(format!("{name} {metric}: {} -> {}", before[metric], now[metric]));
+                            }
+                            (None, Some(_)) => regressions.push(format!("{name} {metric}: no comparable score")),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if old.is_empty() {
+                bail!("text oracle baseline is empty: {}", path.display());
+            }
+            if !regressions.is_empty() {
+                bail!("text oracle regressions (tolerance 0.005): {}", regressions.join(", "));
+            }
+            println!("text oracle baseline: {} per-file scores checked", per_file.len().min(old.len()));
+        }
+    }
     Ok(())
 }
 
 /// Compare our rendering against Poppler's, page 1 of every PDF in a directory.
 ///
 /// This is the measured half of the fidelity gap (`docs/gaps.md` gap 12): until it exists, every
-/// claim about rendering quality is a judgement. It reports rather than gates, because the corpus
-/// is not fetched on CI and because a first reading of a borrowed renderer is a baseline to
-/// improve on, not a bar to clear.
+/// claim about rendering quality is a judgement. Without `--baseline`, it reports only; with a
+/// stored per-file baseline it fails when a score regresses or a compared file stops scoring.
 ///
 /// The score is the share of pixels with no near match in the other renderer's 3x3 neighbourhood
 /// (`pdfcraft_oracle::pixels`), which forgives antialiasing and subpixel placement but not
@@ -352,6 +408,9 @@ pub fn render_oracle(args: &[String]) -> anyhow::Result<()> {
     let hide_annotations = args.iter().any(|a| a == "--hide-annotations");
     let dir =
         args.iter().position(|a| a == "--dir").and_then(|i| args.get(i + 1)).map_or_else(|| root().join("corpus/pdfjs/test/pdfs"), PathBuf::from);
+    let json_out = args.iter().position(|a| a == "--json").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let baseline_path = args.iter().position(|a| a == "--baseline").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let update_baseline = args.iter().any(|a| a == "--update-baseline");
 
     let pdftoppm = match pdfcraft_oracle::pdftoppm() {
         Ok(tool) => tool,
@@ -371,6 +430,7 @@ pub fn render_oracle(args: &[String]) -> anyhow::Result<()> {
     let out_pam = std::env::temp_dir().join(format!("pdfcraft-render-oracle-{}.pam", std::process::id()));
     let (mut scores, mut sizes_differed, mut ours_failed, mut theirs_failed) = (Vec::new(), 0usize, 0usize, 0usize);
     let mut worst: Vec<(f64, String)> = Vec::new();
+    let mut per_file = BTreeMap::new();
     for file in files.iter().take(limit) {
         let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let ours = Command::new(&cli)
@@ -404,7 +464,8 @@ pub fn render_oracle(args: &[String]) -> anyhow::Result<()> {
         match pdfcraft_oracle::pixels::compare(a, b, tolerance) {
             Ok(diff) => {
                 scores.push(diff.percent());
-                worst.push((diff.percent(), name));
+                worst.push((diff.percent(), name.clone()));
+                per_file.insert(name, diff.percent());
             }
             // Different rounding of the page box at this scale: not a fidelity signal.
             Err(_) => sizes_differed = sizes_differed.saturating_add(1),
@@ -430,6 +491,52 @@ pub fn render_oracle(args: &[String]) -> anyhow::Result<()> {
     println!("worst:");
     for (score, name) in worst.iter().take(12) {
         println!("  {score:6.2}%  {name}");
+    }
+    if let Some(path) = json_out {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({"schema": 1, "dpi": dpi, "tolerance": tolerance, "files": per_file.clone()}))?,
+        )?;
+    }
+    if let Some(path) = baseline_path {
+        if update_baseline {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&serde_json::json!({"schema": 1, "dpi": dpi, "tolerance": tolerance, "files": per_file.clone()}))?,
+            )?;
+            println!("render oracle baseline updated: {} files", per_file.len());
+        } else {
+            let baseline: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("reading baseline {}", path.display()))?)?;
+            let old = baseline["files"].as_object().context("render oracle baseline has no files object")?;
+            let mut regressions = Vec::new();
+            if baseline["dpi"].as_u64() != Some(dpi as u64) || baseline["tolerance"].as_u64() != Some(tolerance as u64) {
+                bail!("render oracle settings differ from baseline {} (dpi/tolerance)", path.display());
+            }
+            for name in old.keys().filter(|name| !per_file.contains_key(*name)) {
+                regressions.push(format!("{name}: no comparable score (missing or unreadable input)"));
+            }
+            for (name, now) in &per_file {
+                if let Some(before) = old.get(name).and_then(serde_json::Value::as_f64) {
+                    if *now > before + 0.05 {
+                        regressions.push(format!("{name}: {before:.3}% -> {now:.3}%"));
+                    }
+                }
+            }
+            if old.is_empty() {
+                bail!("render oracle baseline is empty: {}", path.display());
+            }
+            if !regressions.is_empty() {
+                bail!("render oracle regressions (tolerance 0.05 percentage points): {}", regressions.join(", "));
+            }
+            println!("render oracle baseline: {} per-file scores checked", per_file.len().min(old.len()));
+        }
     }
     Ok(())
 }
