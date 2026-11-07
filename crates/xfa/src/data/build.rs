@@ -1,5 +1,5 @@
 use super::values::{FieldDatum, Want, wanted, with_template};
-use super::{Document, HashMap, MAX_DEPTH, XFA_DATA_NS};
+use super::{DatasetFieldWarning, Document, HashMap, MAX_DEPTH, ObjRef, XFA_DATA_NS};
 
 pub(super) fn xml_name(s: &str) -> String {
     let mut out: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' }).collect();
@@ -127,6 +127,19 @@ pub(super) fn skipped(warnings: &mut Vec<String>, reason: &str, som: &str) {
     }
 }
 
+pub(super) fn skipped_field(
+    warnings: &mut Vec<String>,
+    field_warnings: &mut Vec<DatasetFieldWarning>,
+    field: Option<ObjRef>,
+    reason: &str,
+    som: &str,
+) {
+    if let Some(field) = field {
+        field_warnings.push(DatasetFieldWarning { field: Some(field), reason: reason.to_string(), som: som.to_string() });
+    }
+    skipped(warnings, reason, som);
+}
+
 pub(super) const TOO_MANY: &str = "XFA data not written for fields whose data path is too deep or repeats too often";
 
 pub(super) const STRUCTURED: &str = "XFA data not written for fields whose data node holds structured content";
@@ -136,16 +149,16 @@ pub(super) const CONFLICT: &str = "XFA data not written for fields bound to the 
 pub(super) const CONTROL: &str = "Characters XML can't hold were left out of the XFA data of";
 
 /// Fresh data for `wants`: the children of an `xfa:data` element.
-pub(super) fn build_children(wants: &[Want], warnings: &mut Vec<String>) -> String {
+pub(super) fn build_children(wants: &[Want], warnings: &mut Vec<String>, field_warnings: &mut Vec<DatasetFieldWarning>) -> String {
     let mut root = Build::default();
     let mut budget = NewNodes::new();
     for w in wants {
         match root.at(&w.path, &mut budget) {
             Some(node) => node.text = w.text.clone(),
-            None => skipped(warnings, TOO_MANY, &w.som),
+            None => skipped_field(warnings, field_warnings, w.field, TOO_MANY, &w.som),
         }
         if escape(&w.text).1 {
-            skipped(warnings, CONTROL, &w.som);
+            skipped_field(warnings, field_warnings, w.field, CONTROL, &w.som);
         }
     }
     let mut out = String::new();
@@ -156,7 +169,7 @@ pub(super) fn build_children(wants: &[Want], warnings: &mut Vec<String>) -> Stri
 /// The `xfa:data` element for `fields`, built afresh.
 pub fn build_data(doc: &Document, fields: &[FieldDatum]) -> String {
     let wants = with_template(doc, None, |t| wanted(doc, fields, t));
-    format!("<xfa:data>{}</xfa:data>", build_children(&wants, &mut Vec::new()))
+    format!("<xfa:data>{}</xfa:data>", build_children(&wants, &mut Vec::new(), &mut Vec::new()))
 }
 
 pub(super) fn fresh_datasets(data_children: &str) -> String {

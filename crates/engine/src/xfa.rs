@@ -546,7 +546,7 @@ struct Calculation {
     dependencies: HashSet<String>,
 }
 
-struct CalculationPlan {
+pub(crate) struct CalculationPlan {
     calculations: Vec<Calculation>,
     som_by_name: HashMap<String, HashSet<String>>,
     som_by_path: HashMap<pdfcraft_xfa::data::DataPath, HashSet<String>>,
@@ -632,6 +632,64 @@ impl CalculationPlan {
     }
 }
 
+/// The stable part of an XFA field edit: which named fields have change events and which
+/// calculations depend on each field. Values may change between edits; the event/dependency
+/// graph does not unless the form's structure changes.
+pub(crate) struct XfaEditPlan {
+    calculations: Option<Arc<CalculationPlan>>,
+    som_by_name: HashMap<String, HashSet<String>>,
+    eventful_soms: HashSet<String>,
+    has_calculations: bool,
+}
+
+impl XfaEditPlan {
+    fn build(doc: &pdfcraft_cos::Document, tpl: &Template) -> Arc<Self> {
+        let data = pdfcraft_xfa::data_of(doc);
+        let overrides = pdfcraft_xfa::overrides(doc);
+        let live = pdfcraft_xfa::form_tree(tpl, data.as_ref(), &overrides);
+        let by_som = pdfcraft_xfa::fields_by_som(doc);
+        let mut som_by_name: HashMap<String, HashSet<String>> = HashMap::new();
+        for (som, name) in &by_som {
+            som_by_name.entry(name.clone()).or_default().insert(som.clone());
+        }
+        let eventful_soms = live
+            .events
+            .iter()
+            .filter(|event| matches!(event.activity.as_str(), "change" | "exit" | "validate"))
+            .map(|event| event.som.clone())
+            .collect();
+        let has_calculations = live.events.iter().any(|event| event.activity == "calculate");
+        let calculations = CalculationPlan::build(&live, tpl, &by_som).map(Arc::new);
+        Arc::new(Self { calculations, som_by_name, eventful_soms, has_calculations })
+    }
+
+    /// Whether an ordinary field change has a known event or dependent calculation. `None`
+    /// means the plan cannot prove the edit is independent, so callers must use the full path.
+    pub(crate) fn needs_run(&self, names: &[String]) -> Option<bool> {
+        if names.is_empty() {
+            return None;
+        }
+        let mut eventful = false;
+        for name in names {
+            let soms = self.som_by_name.get(name)?;
+            eventful |= soms.iter().any(|som| self.eventful_soms.contains(som));
+        }
+        let calculations = if self.has_calculations {
+            let plan = self.calculations.as_ref()?;
+            !plan.affected(names)?.is_empty()
+        } else {
+            false
+        };
+        Some(eventful || calculations)
+    }
+}
+
+/// Precompute the script dependency graph while opening the document, before a user edit is
+/// timed. The index is reused until a structural XFA edit changes the form instance tree.
+pub(crate) fn xfa_edit_plan(doc: &pdfcraft_cos::Document, tpl: &Template) -> Arc<XfaEditPlan> {
+    XfaEditPlan::build(doc, tpl)
+}
+
 /// Does `name` from a script (`qty`, `page1.qty`, `xfa.form.form.page1.qty`, or a container
 /// such as `table`) name this SOM or one of its ancestors?
 fn som_matches(som: &str, name: &str) -> bool {
@@ -685,6 +743,7 @@ struct Runner<'a, 'b> {
     doc: &'a mut pdfcraft_cos::Document,
     tpl: &'a Template,
     run: &'a mut XfaRun<'b>,
+    edit_plan: Option<Arc<XfaEditPlan>>,
     clock: Clock,
     runs: usize,
     skipped: usize,
@@ -712,7 +771,13 @@ struct Runner<'a, 'b> {
 }
 
 impl<'a, 'b> Runner<'a, 'b> {
-    fn new(doc: &'a mut pdfcraft_cos::Document, tpl: &'a Template, run: &'a mut XfaRun<'b>, budget_ms: u64) -> Self {
+    fn new(
+        doc: &'a mut pdfcraft_cos::Document,
+        tpl: &'a Template,
+        run: &'a mut XfaRun<'b>,
+        budget_ms: u64,
+        edit_plan: Option<Arc<XfaEditPlan>>,
+    ) -> Self {
         let data = pdfcraft_xfa::data_of(doc);
         let ov = pdfcraft_xfa::overrides(doc);
         let budget_ms = budget_ms.saturating_mul(u64::from(run.time_scale));
@@ -720,6 +785,7 @@ impl<'a, 'b> Runner<'a, 'b> {
             doc,
             tpl,
             run,
+            edit_plan,
             clock: Clock::start(budget_ms),
             runs: 0,
             skipped: 0,
@@ -1148,18 +1214,14 @@ impl<'a, 'b> Runner<'a, 'b> {
             let mut changed_names = names.to_vec();
             changed_names.extend(additional_names.iter().cloned());
             changed_names.extend(self.run.changed_fields.iter().cloned());
-            let by_som = self.by_som().clone();
-            let tpl = self.tpl;
-            let live = self.live();
-            let plan = CalculationPlan::build(live, tpl, &by_som);
-            if let Some(plan) = plan
+            if let Some(plan) = self.edit_plan.as_ref().and_then(|plan| plan.calculations.as_ref())
                 && let Some(selected) = plan.affected(&changed_names)
             {
                 let events = plan
                     .calculations
-                    .into_iter()
+                    .iter()
                     .enumerate()
-                    .filter_map(|(index, calculation)| selected.contains(&index).then_some(calculation.event))
+                    .filter_map(|(index, calculation)| selected.contains(&index).then(|| calculation.event.clone()))
                     .collect();
                 return self.calculate_events(events);
             }
@@ -1296,7 +1358,7 @@ pub(crate) fn relayout_changed_text(
 
 /// On open: initialize scripts, then calculations. Returns what they changed.
 pub(crate) fn on_open(doc: &mut pdfcraft_cos::Document, tpl: &Template, run: &mut XfaRun) -> Result<Changes, String> {
-    let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS);
+    let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS, None);
     let events: Vec<ScriptEvent> = r.live().events.iter().filter(|e| e.activity == "initialize" || e.activity == "docReady").cloned().collect();
     for ev in &events {
         r.run(ev, "")?;
@@ -1393,9 +1455,10 @@ pub(crate) fn on_changes(
     names: &[String],
     additional_names: &[String],
     incremental: bool,
+    edit_plan: Option<Arc<XfaEditPlan>>,
     run: &mut XfaRun,
 ) -> Result<(), String> {
-    let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS);
+    let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS, edit_plan);
     for name in names {
         let som = r.by_som().iter().find(|(_, f)| *f == name).map(|(s, _)| s.clone());
         let Some(som) = som else { continue };
@@ -1417,7 +1480,7 @@ pub(crate) fn on_changes(
 /// The form's data changed outside its scripts (a data file imported, a picture chosen): lay
 /// the form out again from the data, then, when `calculate`, run every calculation.
 pub(crate) fn on_data_replaced(doc: &mut pdfcraft_cos::Document, tpl: &Template, calculate: bool, run: &mut XfaRun) -> Result<(), String> {
-    let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS);
+    let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS, None);
     r.relayout()?;
     if calculate {
         r.calculates()?;
@@ -1449,7 +1512,7 @@ pub(crate) fn typed_date(
 
 /// A button's click script (or any event, by SOM path and activity), then calculations.
 pub(crate) fn on_event(doc: &mut pdfcraft_cos::Document, tpl: &Template, som: &str, activity: &str, run: &mut XfaRun) -> Result<(), String> {
-    let mut r = Runner::new(doc, tpl, run, EVENT_BUDGET_MS);
+    let mut r = Runner::new(doc, tpl, run, EVENT_BUDGET_MS, None);
     let events = r.events_of(som, activity);
     if events.is_empty() {
         return Err(format!("{som} has no {activity} script"));

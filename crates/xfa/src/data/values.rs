@@ -86,6 +86,7 @@ fn date_pattern_of(doc: &Document, f: &FieldDatum) -> Option<String> {
 
 /// A value to write: where (the field's SOM path, and the data path it binds to) and what.
 pub(super) struct Want {
+    pub(super) field: Option<ObjRef>,
     pub(super) som: String,
     pub(super) path: DataPath,
     pub(super) text: String,
@@ -255,7 +256,7 @@ pub(super) fn wanted(doc: &Document, fields: &[FieldDatum], tpl: Option<&Templat
             FieldData::Radio(sel) => radio_dataset_value(doc, f, sel),
             FieldData::None => continue,
         };
-        out.push(Want { som, path, text, ensure: false });
+        out.push(Want { field: Some(f.obj), som, path, text, ensure: false });
     }
     out
 }

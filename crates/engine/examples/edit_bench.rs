@@ -119,6 +119,7 @@ fn differential(path: &str) -> Result<(), Box<dyn Error>> {
     let all = fast.get(fast_id).ok_or("the fast document did not open")?.form.to_vec();
     let shard_count = std::env::var("PDFCRAFT_DIFF_SHARDS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
     let shard = std::env::var("PDFCRAFT_DIFF_SHARD").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    let field_filter = std::env::var("PDFCRAFT_DIFF_FIELD").ok();
     if shard_count == 0 || shard >= shard_count {
         return Err(format!("invalid differential shard {shard} of {shard_count}").into());
     }
@@ -132,7 +133,7 @@ fn differential(path: &str) -> Result<(), Box<dyn Error>> {
         }
         let field_shard = editable_fields % shard_count;
         editable_fields += 1;
-        if field_shard != shard {
+        if field_shard != shard || field_filter.as_deref().is_some_and(|name| field.name != name) {
             continue;
         }
         let Some(next) = value(field) else { return Err(format!("editable field {:?} has no differential value", field.name).into()) };

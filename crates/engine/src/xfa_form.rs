@@ -62,6 +62,64 @@ fn xfa_field_datum_ref(f: &pdfcraft_forms::Field) -> pdfcraft_xfa::FieldDatum {
     pdfcraft_xfa::FieldDatum { obj: f.obj, name: f.name.clone(), data }
 }
 
+/// Full-sync per-field warning details, kept in field order so incremental writes can replace
+/// just the diagnostics for fields they touched.
+#[derive(Clone, Debug)]
+pub(crate) struct XfaDatasetWarningCache {
+    fields: Vec<pdfcraft_cos::ObjRef>,
+    by_field: std::collections::HashMap<pdfcraft_cos::ObjRef, Vec<pdfcraft_xfa::DatasetFieldWarning>>,
+}
+
+impl XfaDatasetWarningCache {
+    fn from_write(
+        form: &[pdfcraft_forms::Field],
+        write: &pdfcraft_xfa::DatasetsWrite,
+        field_warnings: &[pdfcraft_xfa::DatasetFieldWarning],
+    ) -> Option<Self> {
+        // Packet-level warnings do not belong to one field, so leave those documents on the full
+        // diagnostic path. Field warnings can be safely refreshed by object reference.
+        if pdfcraft_xfa::format_field_warnings(field_warnings) != write.warnings {
+            return None;
+        }
+        let mut by_field: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        for warning in field_warnings {
+            if let Some(field) = warning.field {
+                by_field.entry(field).or_default().push(warning.clone());
+            }
+        }
+        Some(Self { fields: form.iter().map(|field| field.obj).collect(), by_field })
+    }
+
+    fn replace_fields(&mut self, fields: &std::collections::HashSet<pdfcraft_cos::ObjRef>, warnings: &[pdfcraft_xfa::DatasetFieldWarning]) {
+        for field in fields {
+            self.by_field.remove(field);
+        }
+        for warning in warnings {
+            if let Some(field) = warning.field {
+                self.by_field.entry(field).or_default().push(warning.clone());
+            }
+        }
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        let ordered: Vec<_> = self.fields.iter().filter_map(|field| self.by_field.get(field)).flatten().cloned().collect();
+        pdfcraft_xfa::format_field_warnings(&ordered)
+    }
+}
+
+/// Full-sync warnings and their per-field details for the values and datasets present now.
+pub(crate) fn xfa_dataset_warnings(
+    doc: &pdfcraft_cos::Document,
+    tpl: Option<&pdfcraft_xfa::model::Template>,
+    form: &[pdfcraft_forms::Field],
+) -> Result<(Option<XfaDatasetWarningCache>, Vec<String>), String> {
+    let data: Vec<_> = form.iter().map(xfa_field_datum_ref).collect();
+    let mut warning_doc = doc.clone();
+    let (write, field_warnings) = pdfcraft_xfa::write_datasets_with_details(&mut warning_doc, tpl, &data, None).map_err(|e| e.to_string())?;
+    let cache = XfaDatasetWarningCache::from_write(form, &write, &field_warnings);
+    Ok((cache, write.warnings))
+}
+
 /// Fields whose values were already out of sync with XFA datasets when the document opened.
 /// Keeping these names lets later incremental edits preserve the first full-sync result.
 pub(crate) fn xfa_initial_dataset_dirty_fields(
@@ -105,21 +163,22 @@ pub(crate) fn xfa_sync_datasets(
 }
 
 /// Keep only dirty field values in the datasets packet. `form` is the cached field index for the
-/// current revision; warnings are evaluated against all current fields on a snapshot so they
-/// match a full sync without widening the packet mutation.
+/// current revision; unchanged field warnings are reused while warning-producing dirty fields
+/// trigger a full diagnostic scan, without widening the packet mutation.
 pub(crate) fn xfa_sync_changed_datasets(
     doc: &mut pdfcraft_cos::Document,
     tpl: Option<&pdfcraft_xfa::model::Template>,
     datasets: &mut Option<pdfcraft_cos::ObjRef>,
     form: &[pdfcraft_forms::Field],
     changed: &std::collections::HashSet<String>,
+    cached_warnings: &mut Option<XfaDatasetWarningCache>,
 ) -> Result<Vec<String>, String> {
-    // The full path reports warnings for every field it visits. Recreate that warning set from
-    // the pre-write document state, then keep the actual dataset mutation limited to dirty fields.
-    let all_data: Vec<_> = form.iter().map(|field| xfa_field_datum(pdfcraft_forms::current_field_value(doc, field))).collect();
-    let mut warning_doc = doc.clone();
-    let warnings = pdfcraft_xfa::write_datasets_with(&mut warning_doc, tpl, &all_data, *datasets).map_err(|e| e.to_string())?.warnings;
     if changed.is_empty() {
+        if let Some(warnings) = cached_warnings {
+            return Ok(warnings.warnings());
+        }
+        let (cache, warnings) = xfa_dataset_warnings(doc, tpl, form)?;
+        *cached_warnings = cache;
         return Ok(warnings);
     }
     let data: Vec<pdfcraft_xfa::FieldDatum> = form
@@ -128,12 +187,45 @@ pub(crate) fn xfa_sync_changed_datasets(
         .map(|field| xfa_field_datum(pdfcraft_forms::current_field_value(doc, field)))
         .collect();
     if data.is_empty() {
+        if let Some(warnings) = cached_warnings {
+            return Ok(warnings.warnings());
+        }
+        let (cache, warnings) = xfa_dataset_warnings(doc, tpl, form)?;
+        *cached_warnings = cache;
         return Ok(warnings);
     }
-    let r = pdfcraft_xfa::write_datasets_with(doc, tpl, &data, *datasets).map_err(|e| e.to_string())?;
+    // Keep a pre-write snapshot only for the conservative fallback below. Most field edits raise
+    // no dirty-field warning, so they avoid rebuilding diagnostics across every field.
+    let mut warning_doc = doc.clone();
+    let (r, r_field_warnings) = pdfcraft_xfa::write_datasets_with_details(doc, tpl, &data, *datasets).map_err(|e| e.to_string())?;
     if r.stream.is_some() {
         *datasets = r.stream;
     }
+    let field_warnings = pdfcraft_xfa::format_field_warnings(&r_field_warnings);
+    let changed_objects: std::collections::HashSet<_> = data.iter().map(|field| field.obj).collect();
+    let previously_warned =
+        cached_warnings.as_ref().is_some_and(|warnings| changed_objects.iter().any(|field| warnings.by_field.contains_key(field)));
+    if field_warnings == r.warnings
+        && r_field_warnings.is_empty()
+        && !previously_warned
+        && let Some(warnings) = cached_warnings
+    {
+        warnings.replace_fields(&changed_objects, &r_field_warnings);
+        return Ok(warnings.warnings());
+    }
+
+    // Warning-producing fields can share or nest datasets nodes, so their write may change the
+    // warning status of other fields. Rebuild the full result from the pre-write snapshot.
+    let all_data: Vec<_> = form
+        .iter()
+        .map(|field| {
+            if changed.contains(&field.name) { xfa_field_datum(pdfcraft_forms::current_field_value(doc, field)) } else { xfa_field_datum_ref(field) }
+        })
+        .collect();
+    let (write, field_warnings) =
+        pdfcraft_xfa::write_datasets_with_details(&mut warning_doc, tpl, &all_data, *datasets).map_err(|e| e.to_string())?;
+    *cached_warnings = XfaDatasetWarningCache::from_write(form, &write, &field_warnings);
+    let warnings = write.warnings;
     Ok(warnings)
 }
 

@@ -25,7 +25,9 @@ struct XfaScriptEditConfig<'a> {
     known_form_changes: Option<&'a std::collections::HashSet<String>>,
     form: &'a [pdfcraft_forms::Field],
     data_template: Option<&'a pdfcraft_xfa::model::Template>,
+    edit_plan: Option<Arc<xfa::XfaEditPlan>>,
     initial_dataset_dirty: &'a std::collections::HashSet<String>,
+    dataset_warnings: &'a mut Option<crate::xfa_form::XfaDatasetWarningCache>,
 }
 
 fn apply_fast_form_path(
@@ -99,7 +101,16 @@ fn apply_xfa_script_edits(
     config: XfaScriptEditConfig<'_>,
     scope: &mut Scope,
 ) -> Result<Vec<String>, EditError> {
-    let XfaScriptEditConfig { is_xfa, incremental: incremental_xfa, known_form_changes, form, data_template, initial_dataset_dirty } = config;
+    let XfaScriptEditConfig {
+        is_xfa,
+        incremental: incremental_xfa,
+        known_form_changes,
+        form,
+        data_template,
+        edit_plan,
+        initial_dataset_dirty,
+        dataset_warnings,
+    } = config;
     fn collect(edit: &Edit, changed: &mut Vec<String>, reset: &mut bool) {
         match edit {
             Edit::SetFieldValue { name, .. } => changed.push(name.clone()),
@@ -126,23 +137,34 @@ fn apply_xfa_script_edits(
             dirty_fields.extend(known_form_changes.into_iter().flat_map(|fields| fields.iter().cloned()));
             dirty_fields.extend(initial_dataset_dirty.iter().cloned());
             let incremental_sync = incremental_change && *scope != Scope::Full;
-            let notes = if incremental_sync {
-                guard(|| xfa_sync_changed_datasets(next, data_template.or(Some(&template)), datasets, form, &dirty_fields))
+            let _pre_script_notes = if incremental_sync {
+                guard(|| xfa_sync_changed_datasets(next, data_template.or(Some(&template)), datasets, form, &dirty_fields, dataset_warnings))
             } else {
-                guard(|| xfa_sync_datasets(next, data_template.or(Some(&template)), datasets))
+                guard(|| {
+                    let notes = xfa_sync_datasets(next, data_template.or(Some(&template)), datasets)?;
+                    *dataset_warnings = None;
+                    Ok(notes)
+                })
             }
             .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
             .map_err(EditError::Write)?;
-            cx.xfa_out.errors.extend(notes);
         }
         let calculation_inputs: Vec<String> = known_form_changes.into_iter().flat_map(|names| names.iter().cloned()).collect();
-        let has_som_mapping = changed.iter().chain(&calculation_inputs).any(|name| {
+        let mut all_changed_names = changed.clone();
+        all_changed_names.extend(calculation_inputs.iter().cloned());
+        let has_som_mapping = all_changed_names.iter().any(|name| {
             form.iter()
                 .find(|field| field.name == *name)
                 .is_some_and(|field| next.get(field.obj).as_dict().is_some_and(|dict| dict.get(pdfcraft_xfa::SOM_KEY).is_some()))
         });
         let has_change_work = (!changed.is_empty() || reset)
-            && (xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs)));
+            && if incremental_change {
+                edit_plan.as_ref().and_then(|plan| plan.needs_run(&all_changed_names)).unwrap_or_else(|| {
+                    xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
+                })
+            } else {
+                xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
+            };
         if has_change_work {
             let mut run = xfa::XfaRun {
                 page_count: cx.pages,
@@ -153,7 +175,7 @@ fn apply_xfa_script_edits(
                 ran_away: false,
                 time_scale: cx.xfa_time_scale,
             };
-            let ran = guard(|| xfa::on_changes(next, &template, &changed, &calculation_inputs, incremental_change, &mut run))
+            let ran = guard(|| xfa::on_changes(next, &template, &changed, &calculation_inputs, incremental_change, edit_plan.clone(), &mut run))
                 .unwrap_or_else(|m| Err(format!("the form's scripts failed unexpectedly ({m})")));
             cx.xfa_datasets = run.datasets;
             cx.xfa_changed_fields.extend(std::mem::take(&mut run.changed_fields));
@@ -180,12 +202,19 @@ fn apply_xfa_script_edits(
             None
         };
         notes = if let Some(names) = dirty_fields.as_ref() {
-            guard(|| xfa_sync_changed_datasets(next, data_template, datasets, form, names))
+            guard(|| xfa_sync_changed_datasets(next, data_template, datasets, form, names, dataset_warnings))
         } else {
-            guard(|| xfa_sync_datasets(next, data_template, datasets))
+            guard(|| {
+                let notes = xfa_sync_datasets(next, data_template, datasets)?;
+                *dataset_warnings = None;
+                Ok(notes)
+            })
         }
         .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
         .map_err(EditError::Write)?;
+        // The pre-script sync can report transient warnings that calculations later resolve.
+        // The full path reports the final dataset state, so expose only these post-script notes.
+        cx.xfa_out.errors.extend(notes.iter().cloned());
         // Rebuilding from stale data would discard accepted widget values.
         if notes.is_empty() {
             let changed_layout_names = dirty_fields;
@@ -290,6 +319,8 @@ impl Session {
         let name = doc.name.clone();
         let is_xfa = doc.info.xfa.is_some();
         let xfa_data_template = doc.xfa_data_template.clone();
+        let mut xfa_dataset_warnings = doc.xfa_dataset_warnings.clone();
+        let xfa_edit_plan = doc.xfa_edit_plan.clone();
         let mut scope = scope_of(&edit);
         let mut cx = EditCtx::new(now, doc.generation ^ (id.0 << 48));
         if !js_off {
@@ -408,7 +439,9 @@ impl Session {
                 known_form_changes: known_form_changes.as_ref(),
                 form: &doc.form,
                 data_template: xfa_data_template.as_deref(),
+                edit_plan: xfa_edit_plan.clone(),
                 initial_dataset_dirty: &doc.xfa_initial_dataset_dirty,
+                dataset_warnings: &mut xfa_dataset_warnings,
             },
             &mut scope,
         )?;
@@ -487,6 +520,8 @@ impl Session {
             doc.xfa_scripts_off = true;
             doc.js_output.errors.push(XFA_SCRIPTS_OFF.into());
         }
+        doc.xfa_dataset_warnings = xfa_dataset_warnings;
+        doc.xfa_edit_plan = if scope == Scope::Full || cx.xfa_ran_away { None } else { xfa_edit_plan };
         Ok(())
     }
 
@@ -518,6 +553,10 @@ impl Session {
         doc.edit_notices.clear();
         Self::sync_dirty(doc);
         doc.generation += 1;
+        doc.xfa_dataset_warnings = None;
+        if scope == Scope::Full {
+            doc.xfa_edit_plan = None;
+        }
         Ok(label)
     }
 
@@ -549,6 +588,10 @@ impl Session {
         doc.edit_notices.clear();
         Self::sync_dirty(doc);
         doc.generation += 1;
+        doc.xfa_dataset_warnings = None;
+        if scope == Scope::Full {
+            doc.xfa_edit_plan = None;
+        }
         Ok(label)
     }
 

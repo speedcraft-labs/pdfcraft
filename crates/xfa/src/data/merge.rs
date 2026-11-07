@@ -1,8 +1,10 @@
-use super::build::{Build, CONFLICT, CONTROL, NewNodes, STRUCTURED, TOO_MANY, build_children, escape, fresh_datasets, skipped, xml_name};
+use super::build::{
+    Build, CONFLICT, CONTROL, NewNodes, STRUCTURED, TOO_MANY, build_children, escape, fresh_datasets, skipped, skipped_field, xml_name,
+};
 use super::import::{ImportNode, serialize_nodes};
 use super::values::Want;
 use super::write::MAX_PACKET_WRITE;
-use super::{DataPath, HashMap, MAX_NODES, XFA_DATA_NS};
+use super::{DataPath, DatasetFieldWarning, HashMap, MAX_NODES, XFA_DATA_NS};
 
 /// What a rewrite of the datasets packet does.
 #[derive(Clone, Copy)]
@@ -103,15 +105,15 @@ fn xfa_prefix(n: roxmltree::Node) -> Option<String> {
     n.namespaces().find(|ns| ns.uri() == XFA_DATA_NS).and_then(|ns| ns.name()).filter(|p| !p.is_empty()).map(str::to_string)
 }
 
-fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merged {
+fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_warnings: &mut Vec<DatasetFieldWarning>) -> Merged {
     let wants: &[Want] = match op {
         Op::Values(w) => w,
         Op::Remove(_) | Op::ReplaceData(_) | Op::Picture(..) => &[],
     };
     // Fresh data, where none exists yet (declared with the `xfa` prefix).
-    let fresh_children = |warnings: &mut Vec<String>| match op {
+    let fresh_children = |warnings: &mut Vec<String>, field_warnings: &mut Vec<DatasetFieldWarning>| match op {
         Op::ReplaceData(nodes) => serialize_nodes(nodes, "xfa"),
-        _ => build_children(wants, warnings),
+        _ => build_children(wants, warnings, field_warnings),
     };
     if crate::xml_nesting_depth(text) > crate::MAX_XML_DEPTH {
         warnings.push("The XFA data nests XML elements deeper than the reader accepts; the field values were not written to it".into());
@@ -145,7 +147,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merg
         None if matches!(op, Op::Remove(_) | Op::Picture(..)) => return Merged::Unchanged,
         None if within == Within::Xdp => {
             let root = parsed.root_element();
-            let children = fresh_children(warnings);
+            let children = fresh_children(warnings, field_warnings);
             match append_edit(src, root, &fresh_datasets(&children)) {
                 Some(e) => edits.push(e),
                 None => {
@@ -163,7 +165,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merg
             None if matches!(op, Op::Remove(_) | Op::Picture(..)) => return Merged::Unchanged,
             None => {
                 let prefix = qname(src, &ds.range()).and_then(|q| q.split_once(':')).map(|(p, _)| format!("{p}:")).unwrap_or_default();
-                let children = fresh_children(warnings);
+                let children = fresh_children(warnings, field_warnings);
                 let element = format!("<{prefix}data>{}</{prefix}data>", children);
                 match append_edit(src, ds, &element) {
                     Some(e) => edits.push(e),
@@ -177,7 +179,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merg
     }
     if let Some(data) = data {
         match op {
-            Op::Values(w) => merge_values(src, data, w, &mut edits, warnings),
+            Op::Values(w) => merge_values(src, data, w, &mut edits, warnings, field_warnings),
             Op::ReplaceData(nodes) => {
                 // Everything between the start and end tags; `<xfa:data/>` opens up. Written
                 // with the prefix the packet binds to the data namespace.
@@ -272,7 +274,14 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>) -> Merg
 }
 
 /// The edits that put `wants` into the `data` element.
-fn merge_values(src: &str, data: roxmltree::Node, wants: &[Want], edits: &mut Vec<Edit>, warnings: &mut Vec<String>) {
+fn merge_values(
+    src: &str,
+    data: roxmltree::Node,
+    wants: &[Want],
+    edits: &mut Vec<Edit>,
+    warnings: &mut Vec<String>,
+    field_warnings: &mut Vec<DatasetFieldWarning>,
+) {
     // Element children by local name, per element visited (built once each).
     let mut index: HashMap<roxmltree::NodeId, HashMap<String, Vec<roxmltree::NodeId>>> = HashMap::new();
     let tree = data.document();
@@ -316,7 +325,7 @@ fn merge_values(src: &str, data: roxmltree::Node, wants: &[Want], edits: &mut Ve
                 // Ignore existing XML indentation, but not whitespace in the accepted value.
                 // A skipped mismatch must warn: relayout would otherwise use stale data.
                 if all.trim() != w.text {
-                    skipped(warnings, STRUCTURED, &w.som);
+                    skipped_field(warnings, field_warnings, w.field, STRUCTURED, &w.som);
                 }
                 continue;
             }
@@ -325,7 +334,7 @@ fn merge_values(src: &str, data: roxmltree::Node, wants: &[Want], edits: &mut Ve
             }
             match replace_edit(src, node, &escaped) {
                 Some(e) => edits.push(e),
-                None => skipped(warnings, STRUCTURED, &w.som),
+                None => skipped_field(warnings, field_warnings, w.field, STRUCTURED, &w.som),
             }
         } else {
             // Missing: add the rest of the path below the deepest node that exists. An empty
@@ -348,13 +357,13 @@ fn merge_values(src: &str, data: roxmltree::Node, wants: &[Want], edits: &mut Ve
             match built {
                 Some(b) => b.text = w.text.clone(),
                 None => {
-                    skipped(warnings, TOO_MANY, &w.som);
+                    skipped_field(warnings, field_warnings, w.field, TOO_MANY, &w.som);
                     continue;
                 }
             }
         }
         if dropped {
-            skipped(warnings, CONTROL, &w.som);
+            skipped_field(warnings, field_warnings, w.field, CONTROL, &w.som);
         }
     }
     for (id, build) in added {
@@ -369,10 +378,16 @@ fn merge_values(src: &str, data: roxmltree::Node, wants: &[Want], edits: &mut Ve
 }
 
 /// Merge `ops` into `text` in order. `None`: nothing changed (or nothing could be merged).
-pub(super) fn merge_all(text: &str, within: Within, ops: &[Op], warnings: &mut Vec<String>) -> Option<String> {
+pub(super) fn merge_all(
+    text: &str,
+    within: Within,
+    ops: &[Op],
+    warnings: &mut Vec<String>,
+    field_warnings: &mut Vec<DatasetFieldWarning>,
+) -> Option<String> {
     let mut current: Option<String> = None;
     for op in ops {
-        match merge(current.as_deref().unwrap_or(text), within, *op, warnings) {
+        match merge(current.as_deref().unwrap_or(text), within, *op, warnings, field_warnings) {
             Merged::Changed(t) => current = Some(t),
             Merged::Unchanged => {}
             // Later steps still apply to what merged so far; the reason is in the warnings.

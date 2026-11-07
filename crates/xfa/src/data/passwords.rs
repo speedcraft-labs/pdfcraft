@@ -163,7 +163,7 @@ fn password_dataset_wants(doc: &Document) -> Vec<Want> {
             .into_iter()
             .filter_map(|(som, path, default)| {
                 let cur = data.value_at(&path)?;
-                (!cur.is_empty() && cur != default).then_some(Want { som, path, text: default, ensure: false })
+                (!cur.is_empty() && cur != default).then_some(Want { field: None, som, path, text: default, ensure: false })
             })
             .collect()
     })
@@ -185,7 +185,8 @@ pub fn clear_password_values(doc: &mut Document) -> Result<usize, XfaError> {
     }
     let count = wants.len();
     let reuse = datasets_stream_ref(doc);
-    let report = rewrite(doc, &[Op::Values(&wants)], reuse)?;
+    let mut field_warnings = Vec::new();
+    let report = rewrite(doc, &[Op::Values(&wants)], reuse, &mut field_warnings)?;
     if !report.written || !password_dataset_wants(doc).is_empty() {
         let reason = report.warnings.first().map_or("the XFA datasets password values could not be cleared", String::as_str);
         return Err(XfaError::Malformed(reason.to_string()));

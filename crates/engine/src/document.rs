@@ -55,6 +55,10 @@ pub struct Document {
     pub(crate) xfa_data_template: Option<Arc<pdfcraft_xfa::model::Template>>,
     /// Field values that disagreed with XFA datasets at open and must join later dirty writes.
     pub(crate) xfa_initial_dataset_dirty: std::collections::HashSet<String>,
+    /// Full-sync XFA dataset warnings for the values present when the document was opened.
+    pub(crate) xfa_dataset_warnings: Option<crate::xfa_form::XfaDatasetWarningCache>,
+    /// Script event and calculation dependencies for the current XFA structure.
+    pub(crate) xfa_edit_plan: Option<Arc<crate::xfa::XfaEditPlan>>,
     /// A script of the XFA form ran away, so its scripts are off (see [`Document::xfa_scripts_off`]).
     pub(crate) xfa_scripts_off: bool,
     /// A content-only refresh keeps `info` from before the edit; an edit may have added or
