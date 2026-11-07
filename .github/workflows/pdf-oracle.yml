@@ -1,0 +1,74 @@
+name: PDF oracles
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pdf-oracles:
+    runs-on: [self-hosted, agentbox]
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Poppler and qpdf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils qpdf
+      - name: Allocate runner-local work paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'PDFCRAFT_ORACLE_DIR=%s/pdfcraft-oracles-%s-%s\n' "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s/pdfcraft-target-%s-%s\n' "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Stage pinned IRS, OPM, US Code and fixture PDFs
+        run: bash xtask/fetch-ci-corpus.sh
+      - name: Fetch and verify pinned pdf.js corpus
+        run: |
+          set -euo pipefail
+          mkdir -p "$PDFCRAFT_ORACLE_DIR/pdfjs" corpus
+          if [ -L corpus/pdfjs ] || [ -d corpus/pdfjs ]; then rm -rf corpus/pdfjs; fi
+          ln -s "$PDFCRAFT_ORACLE_DIR/pdfjs" corpus/pdfjs
+          cargo xtask corpus
+      - name: Check pdf.js corpus against robustness baseline
+        run: cargo xtask check
+      - name: Run ignored COS corpus round trips
+        run: cargo test -p pdfcraft-cos --test it corpus_ -- --ignored --nocapture
+      - name: Compare Poppler text and rendering against per-file baselines
+        run: |
+          set -euo pipefail
+          mkdir -p "$PDFCRAFT_ORACLE_DIR/reports"
+          cargo xtask text-oracle --dir "$PDFCRAFT_ORACLE_DIR/corpus/all" \
+            --baseline xtask/baselines/text-oracle.json \
+            --json "$PDFCRAFT_ORACLE_DIR/reports/text-oracle.json"
+          cargo xtask render-oracle --dir "$PDFCRAFT_ORACLE_DIR/corpus/all" --dpi 36 \
+            --baseline xtask/baselines/render-oracle.json \
+            --json "$PDFCRAFT_ORACLE_DIR/reports/render-oracle.json"
+      - name: Publish score summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### PDF oracle scores'
+            for report in "$PDFCRAFT_ORACLE_DIR"/reports/*.json; do
+              [ -f "$report" ] || continue
+              echo "- ${report##*/} records per-file scores; full JSON is attached below."
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pdf-oracle-scores-${{ github.run_id }}
+          path: ${{ runner.temp }}/pdfcraft-oracles-${{ github.run_id }}-${{ github.run_attempt }}/reports/
+          if-no-files-found: ignore
+          retention-days: 30

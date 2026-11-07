@@ -251,6 +251,9 @@ update the numbers.
   `pixels`). **First reading, 250 files at 72 dpi, tolerance 8: 229 compared, median 0.89%, mean
   2.16%, p90 5.35%, 25 within 0.1%.** It reports rather than gates — the corpus is not fetched on
   CI, and a first reading of a borrowed renderer is a baseline to improve on, not a bar to clear.
+  As of 2026-11-07, the fork's Agentbox workflow runs the checked-in fixture and pinned IRS, OPM
+  and US Code PDFs on pull requests and nightly, recording per-file scores and gating regressions
+  against stored baselines.
   The worst results cluster on JBIG2 `bitmap-*` files (`hayro-jbig2` carries 3 local patches) and
   on ZapfDingbats, which points the renderer work at something specific for the first time.
 - **Read the score as a disagreement, not a verdict (2026-10-14).** The worst file of the 250,

@@ -1,0 +1,26 @@
+{
+  "files": {
+    "form.pdf": {
+      "status": "insufficient-reference-text"
+    },
+    "irs-f1040-2025.pdf": {
+      "f1": 0.9990766389658357,
+      "reading_order": 0.684923076923077,
+      "status": "scored"
+    },
+    "irs-f990-2025.pdf": {
+      "f1": 0.9970910718281495,
+      "reading_order": 0.8323333333333334,
+      "status": "scored"
+    },
+    "opm-sf85p-2017.pdf": {
+      "f1": 0.9998573873359954,
+      "reading_order": 0.8493333333333334,
+      "status": "scored"
+    },
+    "uscode-title26-2023.pdf": {
+      "status": "extract-unavailable"
+    }
+  },
+  "schema": 1
+}
