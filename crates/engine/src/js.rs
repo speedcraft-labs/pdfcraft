@@ -24,6 +24,16 @@ struct CachedCalculation {
     dependencies: Vec<(usize, pdfcraft_js::FieldState)>,
 }
 
+struct CalculationCacheWrite<'a> {
+    target: &'a Field,
+    script: &'a str,
+    target_value: &'a str,
+    states: &'a [pdfcraft_js::FieldState],
+    observed: &'a [usize],
+    result: &'a ScriptResult,
+    cacheable: bool,
+}
+
 /// What scripts produced for the viewer since it last looked.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JsOutput {
@@ -259,23 +269,19 @@ impl JsRunner {
         self.doc_scripts.is_empty() && pdfcraft_js::parallel_safe_calculation(script) && pdfcraft_forms::af::calculation_writes(script).is_empty()
     }
 
-    fn remember_calculation(
-        &mut self,
-        target: &Field,
-        script: &str,
-        target_value: &str,
-        states: &[pdfcraft_js::FieldState],
-        observed: &[usize],
-        result: &ScriptResult,
-        cacheable: bool,
-    ) {
-        if !cacheable || !result.changes.is_empty() {
+    fn remember_calculation(&mut self, write: CalculationCacheWrite<'_>) {
+        if !write.cacheable || !write.result.changes.is_empty() {
             return;
         }
-        let dependencies = observed.iter().filter_map(|&index| states.get(index).cloned().map(|state| (index, state))).collect();
+        let dependencies = write.observed.iter().filter_map(|&index| write.states.get(index).cloned().map(|state| (index, state))).collect();
         self.calculation_cache.entries.insert(
-            target.obj,
-            CachedCalculation { script: script.to_owned(), target_value: target_value.to_owned(), value: result.value.clone(), dependencies },
+            write.target.obj,
+            CachedCalculation {
+                script: write.script.to_owned(),
+                target_value: write.target_value.to_owned(),
+                value: write.result.value.clone(),
+                dependencies,
+            },
         );
     }
 
@@ -322,7 +328,15 @@ impl Scripts for JsRunner {
             && o.console.is_empty()
             && o.requests.is_empty();
         let result = self.script_result(&states, value, o);
-        self.remember_calculation(target, script, value, &states, &observed, &result, cacheable);
+        self.remember_calculation(CalculationCacheWrite {
+            target,
+            script,
+            target_value: value,
+            states: &states,
+            observed: &observed,
+            result: &result,
+            cacheable,
+        });
         result
     }
 
@@ -362,7 +376,15 @@ impl Scripts for JsRunner {
                     && outcome.console.is_empty()
                     && outcome.requests.is_empty();
                 let result = self.script_result(&states, &event.value, outcome);
-                self.remember_calculation(call.target, &script, call.value, &states, &observed, &result, cacheable);
+                self.remember_calculation(CalculationCacheWrite {
+                    target: call.target,
+                    script: &script,
+                    target_value: call.value,
+                    states: &states,
+                    observed: &observed,
+                    result: &result,
+                    cacheable,
+                });
                 results[index] = Some(result);
             }
         }
