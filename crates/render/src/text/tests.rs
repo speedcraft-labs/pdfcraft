@@ -28,13 +28,48 @@ fn bench_multi_pattern_search_on_real_pdf_corpus() {
         .new(|(page, words): &(PageText, Vec<String>)| page.find_many_opts(words, false, false))
         .inputs(inputs)
         .equal()
-        .run(&Config {
-            revs: Revs { old: Some(rev("origin/algo/ci")), new: Some(rev("HEAD")) },
-            ..Config::default()
-        })
+        .run(&Config { revs: Revs { old: Some(rev("origin/algo/ci")), new: Some(rev("HEAD")) }, ..Config::default() })
         .expect("paired craft-bench run");
     report.require_publishable().expect("publishable benchmark report");
     let out = std::env::var("CRAFT_BENCH_OUT").expect("CRAFT_BENCH_OUT must name the JSON output path");
+    std::fs::write(out, report.to_json()).expect("write craft-bench JSON");
+    println!("{}", report.to_markdown());
+}
+
+#[test]
+#[ignore = "paired corpus benchmark; run via scripts/bench-run while holding bench.lock"]
+fn bench_bounded_regex_reuse_on_real_pdf_corpus() {
+    use craft_bench::{Config, Paired, report::Revs};
+    use std::{path::PathBuf, sync::Arc};
+
+    fn rev(reference: &str) -> String {
+        let output = std::process::Command::new("git").args(["rev-parse", reference]).output().expect("git rev-parse");
+        assert!(output.status.success(), "git rev-parse {reference}");
+        String::from_utf8(output.stdout).expect("git SHA is UTF-8").trim().to_owned()
+    }
+
+    let corpus = PathBuf::from(std::env::var("ARTCRAFT_CORPUS").expect("ARTCRAFT_CORPUS must point to hyper/corpus"));
+    let pdf = std::fs::read(corpus.join("pdfcraft-public-domain/opm-sf85p-2017.pdf")).expect("pinned public-domain PDF");
+    let mut renderer = crate::PageRenderer::new(Arc::new(pdf), crate::RenderConfig::default());
+    let pattern = String::from(r"\b(?:employee|form|United States)\b");
+    let mut inputs = Vec::new();
+    for page in 0..8 {
+        let out = renderer.render(crate::RenderRequest { page, kind: crate::RequestKind::Text, ..Default::default() });
+        if let Some(text) = out.text {
+            inputs.push((format!("opm-sf85p-page-{page}"), (text.plain_text(), pattern.clone())));
+        }
+    }
+    let report = Paired::new("craft-text bounded regex reuse")
+        .old(|(text, pattern): &(String, String)| regex::RegexBuilder::new(pattern).build().expect("valid test regex").find_iter(text).count())
+        .new(|(text, pattern): &(String, String)| {
+            craft_text::matching::cached_regex(pattern, false).expect("valid test regex").find_iter(text).count()
+        })
+        .inputs(inputs)
+        .equal()
+        .run(&Config { revs: Revs { old: Some(rev("origin/algo/ci")), new: Some(rev("HEAD")) }, ..Config::default() })
+        .expect("paired craft-bench run");
+    report.require_publishable().expect("publishable benchmark report");
+    let out = std::env::var("CRAFT_BENCH_REGEX_OUT").expect("CRAFT_BENCH_REGEX_OUT must name the JSON output path");
     std::fs::write(out, report.to_json()).expect("write craft-bench JSON");
     println!("{}", report.to_markdown());
 }
