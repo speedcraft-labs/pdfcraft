@@ -138,6 +138,11 @@ impl PageText {
         self.find_opts_limited(needle, case_sensitive, whole_words, usize::MAX)
     }
 
+    /// Finds several literals in one traversal, preserving per-query result order.
+    pub fn find_many_opts(&self, needles: &[String], case_sensitive: bool, whole_words: bool) -> Vec<Vec<std::ops::Range<usize>>> {
+        search::find_many(self, needles, case_sensitive, whole_words)
+    }
+
     /// Search with Acrobat's find options, returning at most `limit` glyph ranges.
     pub fn find_opts_limited(&self, needle: &str, case_sensitive: bool, whole_words: bool, limit: usize) -> Vec<std::ops::Range<usize>> {
         search::find(self, needle, case_sensitive, whole_words, limit)
