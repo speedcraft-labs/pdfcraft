@@ -1,4 +1,5 @@
-# actionlint: runner labels that exist in the storytold org but not on GitHub-hosted runners.
+# Custom labels for org self-hosted runners used by workflows in this repository.
 self-hosted-runner:
   labels:
+    - agentbox
     - macos-release
