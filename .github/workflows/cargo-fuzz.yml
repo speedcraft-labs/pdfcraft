@@ -8,13 +8,12 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: cargo-fuzz-${{ github.ref }}-${{ matrix.crate }}-${{ matrix.target }}
-  cancel-in-progress: true
-
 jobs:
   fuzz:
     runs-on: [self-hosted, agentbox]
+    concurrency:
+      group: cargo-fuzz-${{ github.ref }}-${{ matrix.crate }}-${{ matrix.target }}
+      cancel-in-progress: true
     timeout-minutes: 60
     strategy:
       fail-fast: false
