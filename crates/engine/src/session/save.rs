@@ -76,7 +76,7 @@ impl Session {
             pdfcraft_forms::restore_password_values(&mut editor.cos, &typed).map_err(|e| EditError::Reopen(e.to_string()))?;
             if !typed.is_empty() && doc.info.xfa.is_some() {
                 let mut datasets = None;
-                let _ = xfa_sync_datasets(&mut editor.cos, doc.xfa_template.as_deref(), &mut datasets);
+                let _ = xfa_sync_datasets(&mut editor.cos, doc.xfa_data_template.as_deref(), &mut datasets);
             }
             editor.saved = bytes;
             editor.saved_keys = keys;

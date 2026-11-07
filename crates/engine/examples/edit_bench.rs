@@ -71,6 +71,19 @@ fn digest(bytes: &[u8]) -> String {
 fn differential(path: &str) -> Result<(), Box<dyn Error>> {
     use pdfcraft_forms::{Field, FieldKind};
 
+    fn editable(field: &Field) -> bool {
+        if field.read_only() || field.widgets.is_empty() {
+            return false;
+        }
+        match field.kind {
+            FieldKind::Text | FieldKind::CheckBox => true,
+            FieldKind::Radio => field.widgets.iter().any(|widget| widget.on_state.is_some()),
+            FieldKind::Combo => field.has(pdfcraft_forms::flags::EDIT) || !field.options.is_empty(),
+            FieldKind::List => !field.options.is_empty(),
+            FieldKind::PushButton | FieldKind::Signature => false,
+        }
+    }
+
     fn value(field: &Field) -> Option<FieldValue> {
         if field.widgets.is_empty() {
             return None;
@@ -85,6 +98,9 @@ fn differential(path: &str) -> Result<(), Box<dyn Error>> {
                 .find(|state| field.value.first() != Some(state))
                 .or_else(|| field.widgets.iter().find_map(|widget| widget.on_state.clone()))
                 .map(|state| FieldValue::Radio(Some(state))),
+            FieldKind::Combo if field.has(pdfcraft_forms::flags::EDIT) && field.options.is_empty() => {
+                Some(FieldValue::Choice(vec!["differential-value".into()]))
+            }
             FieldKind::Combo | FieldKind::List => field
                 .options
                 .iter()
@@ -101,14 +117,25 @@ fn differential(path: &str) -> Result<(), Box<dyn Error>> {
     let mut slow = Session::new().with_clock(fixed_clock);
     let slow_id = slow.open(path, None, bytes, None)?;
     let all = fast.get(fast_id).ok_or("the fast document did not open")?.form.to_vec();
+    let shard_count = std::env::var("PDFCRAFT_DIFF_SHARDS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
+    let shard = std::env::var("PDFCRAFT_DIFF_SHARD").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+    if shard_count == 0 || shard >= shard_count {
+        return Err(format!("invalid differential shard {shard} of {shard_count}").into());
+    }
     let mut compared = 0usize;
     let mut actionful = 0usize;
+    let mut editable_fields = 0usize;
     let mut seen = std::collections::HashSet::new();
     for field in &all {
-        if !seen.insert(field.name.clone()) {
+        if !editable(field) || !seen.insert(field.name.clone()) {
             continue;
         }
-        let Some(next) = value(field) else { continue };
+        let field_shard = editable_fields % shard_count;
+        editable_fields += 1;
+        if field_shard != shard {
+            continue;
+        }
+        let Some(next) = value(field) else { return Err(format!("editable field {:?} has no differential value", field.name).into()) };
         if !field.actions.is_empty() || !field.actions.unsupported.is_empty() {
             actionful += 1;
         }
@@ -133,14 +160,28 @@ fn differential(path: &str) -> Result<(), Box<dyn Error>> {
         let fast_output = fast.take_js_output(fast_id);
         let slow_output = slow.take_js_output(slow_id);
         if fast_output != slow_output {
-            return Err(format!("fast and general JavaScript output differs for {:?}", field.name).into());
+            return Err(format!("fast and general JavaScript output differs for {:?}: {fast_output:?} vs {slow_output:?}", field.name).into());
         }
         compared += 1;
     }
     println!("DIFFERENTIAL_FILE={path}");
     println!("DIFFERENTIAL_FIELDS={compared}");
+    println!("DIFFERENTIAL_EDITABLE_FIELDS={editable_fields}");
+    println!("DIFFERENTIAL_SHARD={shard}/{shard_count}");
     println!("DIFFERENTIAL_ACTIONFUL={actionful}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::differential;
+
+    #[test]
+    #[ignore = "requires the SF-85P corpus file and compares all editable fields"]
+    fn sf85p_every_editable_field_matches_the_full_xfa_path() {
+        let path = std::env::var("PDFCRAFT_SF85P_PATH").expect("set PDFCRAFT_SF85P_PATH to the SF-85P corpus file");
+        differential(&path).expect("fast and full XFA edit paths should match for every editable field");
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

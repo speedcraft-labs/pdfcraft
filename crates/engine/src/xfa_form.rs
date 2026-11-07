@@ -37,18 +37,52 @@ pub(crate) fn undrawn_field_warnings(doc: &pdfcraft_cos::Document) -> Vec<String
 
 /// The form's fields as the XFA data layer wants them.
 fn xfa_field_data(doc: &pdfcraft_cos::Document) -> Vec<pdfcraft_xfa::FieldDatum> {
+    pdfcraft_forms::fields(doc).into_iter().map(xfa_field_datum).collect()
+}
+
+fn xfa_field_datum(f: pdfcraft_forms::Field) -> pdfcraft_xfa::FieldDatum {
     use pdfcraft_forms::FieldKind as K;
-    pdfcraft_forms::fields(doc)
-        .into_iter()
-        .map(|f| {
-            let data = match f.kind {
-                K::Text | K::Combo | K::List => pdfcraft_xfa::FieldData::Text(f.value.join("\n")),
-                K::CheckBox => pdfcraft_xfa::FieldData::Check(!f.value.is_empty()),
-                K::Radio => pdfcraft_xfa::FieldData::Radio(f.value.first().cloned()),
-                K::PushButton | K::Signature => pdfcraft_xfa::FieldData::None,
-            };
-            pdfcraft_xfa::FieldDatum { obj: f.obj, name: f.name, data }
+    let data = match f.kind {
+        K::Text | K::Combo | K::List => pdfcraft_xfa::FieldData::Text(f.value.join("\n")),
+        K::CheckBox => pdfcraft_xfa::FieldData::Check(!f.value.is_empty()),
+        K::Radio => pdfcraft_xfa::FieldData::Radio(f.value.first().cloned()),
+        K::PushButton | K::Signature => pdfcraft_xfa::FieldData::None,
+    };
+    pdfcraft_xfa::FieldDatum { obj: f.obj, name: f.name, data }
+}
+
+fn xfa_field_datum_ref(f: &pdfcraft_forms::Field) -> pdfcraft_xfa::FieldDatum {
+    use pdfcraft_forms::FieldKind as K;
+    let data = match f.kind {
+        K::Text | K::Combo | K::List => pdfcraft_xfa::FieldData::Text(f.value.join("\n")),
+        K::CheckBox => pdfcraft_xfa::FieldData::Check(!f.value.is_empty()),
+        K::Radio => pdfcraft_xfa::FieldData::Radio(f.value.first().cloned()),
+        K::PushButton | K::Signature => pdfcraft_xfa::FieldData::None,
+    };
+    pdfcraft_xfa::FieldDatum { obj: f.obj, name: f.name.clone(), data }
+}
+
+/// Fields whose values were already out of sync with XFA datasets when the document opened.
+/// Keeping these names lets later incremental edits preserve the first full-sync result.
+pub(crate) fn xfa_initial_dataset_dirty_fields(
+    doc: &pdfcraft_cos::Document,
+    tpl: Option<&pdfcraft_xfa::model::Template>,
+    form: &[pdfcraft_forms::Field],
+) -> std::collections::HashSet<String> {
+    let data: Vec<_> = form.iter().map(xfa_field_datum_ref).collect();
+    let dirty_soms: std::collections::HashSet<_> = pdfcraft_xfa::unsynced_soms_with(doc, tpl, &data).into_iter().collect();
+    form.iter()
+        .filter(|field| {
+            let object = doc.get(field.obj);
+            let som = object
+                .as_dict()
+                .and_then(|dict| dict.get(pdfcraft_xfa::SOM_KEY))
+                .map(|value| doc.resolve(value))
+                .and_then(|value| value.as_string().map(|value| value.to_text()))
+                .unwrap_or_else(|| field.name.clone());
+            dirty_soms.contains(&som)
         })
+        .map(|field| field.name.clone())
         .collect()
 }
 
@@ -68,6 +102,39 @@ pub(crate) fn xfa_sync_datasets(
         *datasets = r.stream;
     }
     Ok(r.warnings)
+}
+
+/// Keep only dirty field values in the datasets packet. `form` is the cached field index for the
+/// current revision; warnings are evaluated against all current fields on a snapshot so they
+/// match a full sync without widening the packet mutation.
+pub(crate) fn xfa_sync_changed_datasets(
+    doc: &mut pdfcraft_cos::Document,
+    tpl: Option<&pdfcraft_xfa::model::Template>,
+    datasets: &mut Option<pdfcraft_cos::ObjRef>,
+    form: &[pdfcraft_forms::Field],
+    changed: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, String> {
+    // The full path reports warnings for every field it visits. Recreate that warning set from
+    // the pre-write document state, then keep the actual dataset mutation limited to dirty fields.
+    let all_data: Vec<_> = form.iter().map(|field| xfa_field_datum(pdfcraft_forms::current_field_value(doc, field))).collect();
+    let mut warning_doc = doc.clone();
+    let warnings = pdfcraft_xfa::write_datasets_with(&mut warning_doc, tpl, &all_data, *datasets).map_err(|e| e.to_string())?.warnings;
+    if changed.is_empty() {
+        return Ok(warnings);
+    }
+    let data: Vec<pdfcraft_xfa::FieldDatum> = form
+        .iter()
+        .filter(|field| changed.contains(&field.name))
+        .map(|field| xfa_field_datum(pdfcraft_forms::current_field_value(doc, field)))
+        .collect();
+    if data.is_empty() {
+        return Ok(warnings);
+    }
+    let r = pdfcraft_xfa::write_datasets_with(doc, tpl, &data, *datasets).map_err(|e| e.to_string())?;
+    if r.stream.is_some() {
+        *datasets = r.stream;
+    }
+    Ok(warnings)
 }
 
 /// What a document whose form script ran away is told.
@@ -158,8 +225,11 @@ pub(crate) fn sync_xfa_state(doc: &mut Document) {
             if doc.xfa.is_none() {
                 // Back after an undo: the XFA's own warnings apply again, the strip's don't.
                 doc.xfa_warnings.retain(|w| !w.starts_with(XFA_REMOVED_PREFIX));
+                if doc.xfa_data_template.is_none() {
+                    doc.xfa_data_template = xfa::data_template(cos);
+                }
                 if doc.xfa_template.is_none() && !doc.xfa_scripts_off {
-                    doc.xfa_template = xfa::template(cos);
+                    doc.xfa_template = doc.xfa_data_template.clone().filter(|template| pdfcraft_xfa::has_scripts(template));
                 }
             }
             doc.xfa = Some(report);
@@ -167,6 +237,8 @@ pub(crate) fn sync_xfa_state(doc: &mut Document) {
         None => {
             doc.xfa = None;
             doc.xfa_template = None;
+            doc.xfa_data_template = None;
+            doc.xfa_initial_dataset_dirty.clear();
             // Only what the strip said stays (the XFA's own warnings no longer apply).
             doc.xfa_warnings.retain(|w| w.starts_with(XFA_REMOVED_PREFIX));
         }

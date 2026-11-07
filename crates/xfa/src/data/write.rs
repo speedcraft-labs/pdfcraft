@@ -61,6 +61,27 @@ pub fn write_datasets_with(
     rewrite(doc, &[Op::Values(&wants)], reuse)
 }
 
+/// The SOMs whose current field values would change the datasets packet if a full write ran.
+/// This lets callers remember pre-existing data/field differences before switching to dirty
+/// writes for individual edits.
+pub fn unsynced_soms_with(doc: &Document, tpl: Option<&Template>, fields: &[FieldDatum]) -> Vec<String> {
+    let wants = with_template(doc, tpl, |t| wanted(doc, fields, t));
+    let data = crate::read_packets(doc).ok().flatten().and_then(|packets| crate::parse_datasets(&packets.xdp));
+    let Some(data) = data else {
+        // With no readable data tree, the full writer must still build the initial packet from
+        // every field, including empty values that supply its element structure.
+        return wants.into_iter().map(|want| want.som).collect();
+    };
+    wants
+        .into_iter()
+        .filter(|want| {
+            let existing = data.value_at(&want.path);
+            existing.as_deref() != Some(want.text.as_str()) && (existing.is_some() || !want.text.is_empty() || want.ensure)
+        })
+        .map(|want| want.som)
+        .collect()
+}
+
 /// Make sure the data has at least `count` instances of `name` under `parent` (a script added
 /// rows: the layout repeats the subform once per data instance).
 pub fn add_data_instances(doc: &mut Document, parent: &DataPath, name: &str, count: usize) -> Result<DatasetsWrite, XfaError> {

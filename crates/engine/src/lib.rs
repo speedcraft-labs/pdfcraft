@@ -136,7 +136,9 @@ pub use comments::{SummarySort, comment_kind, comment_summary, comment_type_name
 #[cfg(test)]
 use document::page_runs;
 pub use document::{Document, EditNotice, TextNotice, display_bytes_for, render_password_for};
-use document::{display_bytes, info_fields, recovered_render_password, same_pages, shown_under_redactions, undrawn_notices};
+use document::{
+    display_bytes, info_fields, recovered_render_password, same_pages, shown_under_redactions, undrawn_notices, undrawn_notices_for_fields,
+};
 pub use edit::{BATCH_LABELS, EDIT_LABELS, Edit};
 pub use error::{EditError, SourceProblem};
 pub use fill_sign::{displayed_offset, text_box_at, typed_signature_graphic, typed_signature_shape};
@@ -155,7 +157,8 @@ use sources::{open_source, open_source_with};
 use test_hooks::{check_refresh_panic, panic_on_refresh, record_link_scan, record_marker_scan, reset_secondary_scan_counts, secondary_scan_counts};
 use xfa_form::{
     XFA_REMOVED_PREFIX, XFA_SCRIPTS_OFF, decode_data_file, image_content_type, is_xfa_data_file, note_warnings, strip_xfa, sync_xfa_state,
-    undrawn_field_warnings, xfa_after_data_change, xfa_layout, xfa_redraw, xfa_sync_datasets, xfa_values_from_datasets,
+    undrawn_field_warnings, xfa_after_data_change, xfa_initial_dataset_dirty_fields, xfa_layout, xfa_redraw, xfa_sync_changed_datasets,
+    xfa_sync_datasets, xfa_values_from_datasets,
 };
 
 mod clock;

@@ -40,8 +40,8 @@ pub use values::{FieldData, FieldDatum, is_on, read_values, read_values_with};
 #[cfg(test)]
 pub(crate) use write::ENSURED;
 pub use write::{
-    DatasetsWrite, add_data_instances, remove_data_instance, write_data_ops, write_data_value, write_datasets, write_datasets_reusing,
-    write_datasets_with,
+    DatasetsWrite, add_data_instances, remove_data_instance, unsynced_soms_with, write_data_ops, write_data_value, write_datasets,
+    write_datasets_reusing, write_datasets_with,
 };
 
 const XFA_DATA_NS: &str = "http://www.xfa.org/schema/xfa-data/1.0/";

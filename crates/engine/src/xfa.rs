@@ -5,7 +5,7 @@
 //! presence and access changes become overrides kept in the PDF, added or removed rows change
 //! the datasets, and any of those lays the form out again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_js::xfa::{XfaDoc, XfaEffect, XfaEvent, XfaKind, XfaNode};
@@ -200,6 +200,436 @@ fn plain_som(som: &str) -> String {
         }
     }
     out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CalcToken {
+    Ident(String),
+    Symbol(char),
+    Literal,
+}
+
+/// Tokenize the deliberately small, side-effect-free subset for which a calculation's field
+/// reads can be proven. Anything unfamiliar makes the caller run every calculation.
+fn calc_tokens(source: &str) -> Option<Vec<CalcToken>> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let byte = *bytes.get(at)?;
+        if byte.is_ascii_whitespace() {
+            at += 1;
+        } else if bytes.get(at..at + 2) == Some(b"//") {
+            at += 2;
+            while at < bytes.len() && bytes.get(at) != Some(&b'\n') {
+                at += 1;
+            }
+        } else if bytes.get(at..at + 2) == Some(b"/*") {
+            at += 2;
+            let tail = bytes.get(at..)?;
+            let end = tail.windows(2).position(|window| window == b"*/")?;
+            at += end + 2;
+        } else if byte == b'\'' || byte == b'"' {
+            let quote = byte;
+            at += 1;
+            let mut closed = false;
+            while at < bytes.len() {
+                match bytes.get(at).copied()? {
+                    b'\\' => at = at.saturating_add(2),
+                    value if value == quote => {
+                        at += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\n' | b'\r' => return None,
+                    _ => at += 1,
+                }
+            }
+            if !closed {
+                return None;
+            }
+            tokens.push(CalcToken::Literal);
+        } else if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' {
+            let start = at;
+            at += 1;
+            while bytes.get(at).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$') {
+                at += 1;
+            }
+            tokens.push(CalcToken::Ident(std::str::from_utf8(bytes.get(start..at)?).ok()?.to_string()));
+        } else if byte.is_ascii_digit() {
+            at += 1;
+            while bytes.get(at).is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'_')) {
+                at += 1;
+            }
+            tokens.push(CalcToken::Literal);
+        } else if byte.is_ascii() {
+            tokens.push(CalcToken::Symbol(char::from(byte)));
+            at += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(tokens)
+}
+
+const CALC_BUILTINS: &[&str] = &[
+    "abs",
+    "at",
+    "avg",
+    "ceil",
+    "choose",
+    "concat",
+    "count",
+    "date2num",
+    "datefmt",
+    "exists",
+    "floor",
+    "hasvalue",
+    "isodate2num",
+    "left",
+    "len",
+    "lower",
+    "ltrim",
+    "max",
+    "min",
+    "mod",
+    "num2date",
+    "oneof",
+    "parse",
+    "replace",
+    "right",
+    "round",
+    "rtrim",
+    "space",
+    "str",
+    "stuff",
+    "substr",
+    "sum",
+    "upper",
+    "within",
+    "wordnum",
+    "Number",
+    "String",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "Math",
+    "return",
+    "and",
+    "or",
+    "not",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "NaN",
+    "Infinity",
+    "this",
+    "rawValue",
+    "value",
+];
+
+fn is_calc_builtin(name: &str) -> bool {
+    CALC_BUILTINS.contains(&name) || {
+        let lower = name.to_ascii_lowercase();
+        CALC_BUILTINS.contains(&lower.as_str())
+    }
+}
+
+fn is_calc_dynamic(name: &str) -> bool {
+    matches!(
+        name,
+        "xfa"
+            | "event"
+            | "resolveNode"
+            | "resolveNodes"
+            | "somExpression"
+            | "parent"
+            | "instanceManager"
+            | "presence"
+            | "access"
+            | "layout"
+            | "host"
+            | "datasets"
+            | "data"
+            | "form"
+            | "template"
+            | "execEvent"
+            | "eval"
+            | "uuid"
+            | "get"
+            | "post"
+            | "put"
+            | "now"
+            | "today"
+            | "locale"
+            | "date"
+            | "time"
+            | "var"
+            | "let"
+            | "const"
+            | "function"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "switch"
+            | "try"
+            | "catch"
+            | "throw"
+            | "new"
+    )
+}
+
+/// Field dependencies for one calculate script. This intentionally accepts only direct field
+/// references and deterministic expressions; XFA navigation, control flow, dynamic indexing,
+/// side effects, and unknown identifiers keep the full-form calculation path.
+struct CalcFieldIndex {
+    by_suffix: HashMap<String, Vec<String>>,
+    by_leaf: HashMap<String, Vec<String>>,
+}
+
+impl CalcFieldIndex {
+    fn new(fields: &HashSet<String>) -> Self {
+        let mut by_suffix: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_leaf: HashMap<String, Vec<String>> = HashMap::new();
+        for som in fields {
+            let plain = plain_som(som);
+            let parts: Vec<_> = plain.split('.').collect();
+            for start in 0..parts.len() {
+                by_suffix.entry(parts[start..].join(".")).or_default().push(som.clone());
+            }
+            if let Some(leaf) = parts.last() {
+                by_leaf.entry((*leaf).to_string()).or_default().push(som.clone());
+            }
+        }
+        Self { by_suffix, by_leaf }
+    }
+}
+
+#[cfg(test)]
+fn calc_script_reads(source: &str, target: &str, fields: &HashSet<String>) -> Option<HashSet<String>> {
+    calc_script_reads_indexed(source, target, &CalcFieldIndex::new(fields))
+}
+
+fn calc_script_reads_indexed(source: &str, target: &str, fields: &CalcFieldIndex) -> Option<HashSet<String>> {
+    let tokens = calc_tokens(source)?;
+    let mut field_references = HashMap::new();
+    let mut qualified_parts = HashSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let CalcToken::Ident(name) = token else { continue };
+        let Some(candidates) = fields.by_leaf.get(name) else { continue };
+        let mut path = vec![name.as_str()];
+        let mut cursor = index;
+        while cursor >= 2
+            && matches!(tokens.get(cursor - 1), Some(CalcToken::Symbol('.')))
+            && matches!(tokens.get(cursor - 2), Some(CalcToken::Ident(_)))
+        {
+            let Some(CalcToken::Ident(prefix)) = tokens.get(cursor - 2) else { break };
+            path.push(prefix.as_str());
+            cursor -= 2;
+        }
+        path.reverse();
+        let qualified = path.join(".");
+        let som = if path.len() > 1 {
+            fields.by_suffix.get(&qualified).and_then(|items| (items.len() == 1).then(|| items.first().cloned()).flatten())?
+        } else {
+            (candidates.len() == 1).then(|| candidates.first().cloned()).flatten()?
+        };
+        field_references.insert(index, som);
+        for part in cursor..=index {
+            if matches!(tokens.get(part), Some(CalcToken::Ident(_))) {
+                qualified_parts.insert(part);
+            }
+        }
+    }
+    let mut reads = HashSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let CalcToken::Ident(name) = token else {
+            if matches!(token, CalcToken::Symbol('[' | ']' | '{' | '}')) || (matches!(token, CalcToken::Symbol(';')) && index + 1 != tokens.len()) {
+                return None;
+            }
+            continue;
+        };
+        if is_calc_dynamic(name) || name.starts_with('$') {
+            return None;
+        }
+
+        if name == "this" {
+            let is_own_value = matches!(tokens.get(index + 1), Some(CalcToken::Symbol('.')))
+                && matches!(tokens.get(index + 2), Some(CalcToken::Ident(property)) if property == "rawValue" || property == "value");
+            if !is_own_value {
+                return None;
+            }
+            reads.insert(target.to_string());
+            continue;
+        }
+        if name == "rawValue" || name == "value" {
+            if !matches!(index.checked_sub(1).and_then(|i| tokens.get(i)), Some(CalcToken::Symbol('.'))) {
+                return None;
+            }
+            if matches!(tokens.get(index + 1), Some(CalcToken::Symbol('.'))) {
+                return None;
+            }
+            continue;
+        }
+
+        if let Some(som) = field_references.get(&index) {
+            reads.insert(som.clone());
+            if assignment_after_field(&tokens, index) && som != target {
+                return None;
+            }
+        } else if !is_calc_builtin(name) && !qualified_parts.contains(&index) {
+            return None;
+        }
+
+        if matches!(tokens.get(index + 1), Some(CalcToken::Symbol('('))) && !is_calc_builtin(name) {
+            return None;
+        }
+    }
+    reads.insert(target.to_string());
+    Some(reads)
+}
+
+fn assignment_after_field(tokens: &[CalcToken], index: usize) -> bool {
+    if index >= 2
+        && matches!(
+            (tokens.get(index - 2), tokens.get(index - 1)),
+            (Some(CalcToken::Symbol('+')), Some(CalcToken::Symbol('+'))) | (Some(CalcToken::Symbol('-')), Some(CalcToken::Symbol('-')))
+        )
+    {
+        return true;
+    }
+    let mut at = index.saturating_add(1);
+    if matches!(tokens.get(at), Some(CalcToken::Symbol('.'))) {
+        at = at.saturating_add(1);
+        if !matches!(tokens.get(at), Some(CalcToken::Ident(property)) if property == "rawValue" || property == "value") {
+            return false;
+        }
+        at = at.saturating_add(1);
+    }
+    let symbol = |offset| match tokens.get(at + offset) {
+        Some(CalcToken::Symbol(value)) => Some(*value),
+        _ => None,
+    };
+    if matches!(
+        (symbol(0), symbol(1)),
+        (Some('+'), Some('='))
+            | (Some('-'), Some('='))
+            | (Some('*'), Some('='))
+            | (Some('/'), Some('='))
+            | (Some('%'), Some('='))
+            | (Some('&'), Some('='))
+            | (Some('|'), Some('='))
+            | (Some('^'), Some('='))
+            | (Some('+'), Some('+'))
+            | (Some('-'), Some('-'))
+    ) || matches!(
+        (symbol(0), symbol(1), symbol(2)),
+        (Some('*'), Some('*'), Some('='))
+            | (Some('&'), Some('&'), Some('='))
+            | (Some('|'), Some('|'), Some('='))
+            | (Some('?'), Some('?'), Some('='))
+            | (Some('<'), Some('<'), Some('='))
+            | (Some('>'), Some('>'), Some('='))
+    ) || matches!((symbol(0), symbol(1), symbol(2), symbol(3)), (Some('>'), Some('>'), Some('>'), Some('=')))
+    {
+        return true;
+    }
+    symbol(0) == Some('=')
+        && !matches!(symbol(1), Some('=' | '>'))
+        && !matches!(at.checked_sub(1).and_then(|i| tokens.get(i)), Some(CalcToken::Symbol('=' | '!' | '<' | '>')))
+}
+
+struct Calculation {
+    event: ScriptEvent,
+    dependencies: HashSet<String>,
+}
+
+struct CalculationPlan {
+    calculations: Vec<Calculation>,
+    som_by_name: HashMap<String, HashSet<String>>,
+    som_by_path: HashMap<pdfcraft_xfa::data::DataPath, HashSet<String>>,
+    path_by_som: HashMap<String, pdfcraft_xfa::data::DataPath>,
+}
+
+impl CalculationPlan {
+    fn build(live: &LiveForm, tpl: &Template, by_som: &HashMap<String, String>) -> Option<Self> {
+        if live.truncated {
+            return None;
+        }
+        fn collect_fields(node: &FormNode, fields: &mut HashSet<String>, depth: usize) -> bool {
+            if depth > 64 {
+                return false;
+            }
+            if node.kind == Some(NodeKind::Field) {
+                fields.insert(node.som.clone());
+            }
+            node.children.iter().all(|child| collect_fields(child, fields, depth + 1))
+        }
+        let mut fields = HashSet::new();
+        if !collect_fields(&live.root, &mut fields, 0) {
+            return None;
+        }
+        let field_index = CalcFieldIndex::new(&fields);
+        let mut calculations = Vec::new();
+        for event in live.events.iter().filter(|event| event.activity == "calculate") {
+            if !fields.contains(&event.som) {
+                return None;
+            }
+            let dependencies = calc_script_reads_indexed(&event.script, &event.som, &field_index)?;
+            calculations.push(Calculation { event: event.clone(), dependencies });
+        }
+        let mut som_by_name: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut som_by_path: HashMap<pdfcraft_xfa::data::DataPath, HashSet<String>> = HashMap::new();
+        let mut path_by_som = HashMap::new();
+        for som in &fields {
+            if let Some(name) = by_som.get(som) {
+                som_by_name.entry(name.clone()).or_default().insert(som.clone());
+            }
+            let path = pdfcraft_xfa::data_path(tpl, som);
+            som_by_path.entry(path.clone()).or_default().insert(som.clone());
+            path_by_som.insert(som.clone(), path);
+        }
+        Some(Self { calculations, som_by_name, som_by_path, path_by_som })
+    }
+
+    fn affected(&self, changed_names: &[String]) -> Option<HashSet<usize>> {
+        if changed_names.is_empty() {
+            return None;
+        }
+        let mut dirty = HashSet::new();
+        for name in changed_names {
+            dirty.extend(self.som_by_name.get(name)?.iter().cloned());
+        }
+        if dirty.is_empty() {
+            return None;
+        }
+        let changed_paths: HashSet<_> = dirty.iter().filter_map(|som| self.path_by_som.get(som)).cloned().collect();
+        for path in changed_paths {
+            dirty.extend(self.som_by_path.get(&path)?.iter().cloned());
+        }
+        let mut selected = HashSet::new();
+        loop {
+            let mut added = false;
+            for (index, calculation) in self.calculations.iter().enumerate() {
+                if selected.contains(&index) || calculation.dependencies.is_disjoint(&dirty) {
+                    continue;
+                }
+                selected.insert(index);
+                let target = calculation.event.som.clone();
+                dirty.insert(target.clone());
+                if let Some(path) = self.path_by_som.get(&target) {
+                    dirty.extend(self.som_by_path.get(path)?.iter().cloned());
+                }
+                added = true;
+            }
+            if !added {
+                break;
+            }
+        }
+        Some(selected)
+    }
 }
 
 /// Does `name` from a script (`qty`, `page1.qty`, `xfa.form.form.page1.qty`, or a container
@@ -707,6 +1137,37 @@ impl<'a, 'b> Runner<'a, 'b> {
     /// the script set a value itself.
     fn calculates(&mut self) -> Result<(), String> {
         let events: Vec<ScriptEvent> = self.live().events.iter().filter(|e| e.activity == "calculate").cloned().collect();
+        self.calculate_events(events)
+    }
+
+    /// After an ordinary field edit, run only the scripts whose statically visible reads
+    /// intersect the edited fields (and their dependents). Any script outside a small pure
+    /// subset, a structural change, or an unknown field name retains the full-path behavior.
+    fn calculates_after_change(&mut self, names: &[String], additional_names: &[String], incremental: bool) -> Result<(), String> {
+        if incremental && !self.run.structure_changed {
+            let mut changed_names = names.to_vec();
+            changed_names.extend(additional_names.iter().cloned());
+            changed_names.extend(self.run.changed_fields.iter().cloned());
+            let by_som = self.by_som().clone();
+            let tpl = self.tpl;
+            let live = self.live();
+            let plan = CalculationPlan::build(live, tpl, &by_som);
+            if let Some(plan) = plan
+                && let Some(selected) = plan.affected(&changed_names)
+            {
+                let events = plan
+                    .calculations
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, calculation)| selected.contains(&index).then_some(calculation.event))
+                    .collect();
+                return self.calculate_events(events);
+            }
+        }
+        self.calculates()
+    }
+
+    fn calculate_events(&mut self, events: Vec<ScriptEvent>) -> Result<(), String> {
         for ev in &events {
             let Some(o) = self.run(ev, "")? else { continue };
             if o.error.is_some() || o.effects.iter().any(|e| matches!(e, XfaEffect::SetValue { som, .. } if *som == ev.som)) {
@@ -796,6 +1257,7 @@ pub(crate) fn relayout_changed_text(
     doc: &mut pdfcraft_cos::Document,
     cached: Option<&Template>,
     before: &[pdfcraft_forms::Field],
+    changed_names: Option<&HashSet<String>>,
 ) -> Result<Option<Vec<String>>, String> {
     if pdfcraft_xfa::existing_layout(doc).is_none() {
         return Ok(None);
@@ -804,6 +1266,7 @@ pub(crate) fn relayout_changed_text(
     let mut changed = before
         .iter()
         .filter(|f| f.kind == pdfcraft_forms::FieldKind::Text && f.has(pdfcraft_forms::flags::MULTILINE))
+        .filter(|f| changed_names.is_none_or(|names| names.contains(&f.name)))
         .filter_map(|f| {
             let object = current.get(f.obj);
             let dict = object.as_dict()?;
@@ -842,11 +1305,96 @@ pub(crate) fn on_open(doc: &mut pdfcraft_cos::Document, tpl: &Template, run: &mu
     r.finish()
 }
 
+/// Whether setting a field can run an XFA event at all. Avoid constructing the live form and
+/// parsing its entire datasets tree on edits when a template only has open/click events.
+pub(crate) fn has_calculation_scripts(tpl: &Template) -> bool {
+    use pdfcraft_xfa::model::{Field, Node, Script};
+
+    fn calculations(scripts: &[Script]) -> bool {
+        scripts.iter().any(|script| script.activity == "calculate" && !script.text.trim().is_empty())
+    }
+    fn field(field: &Field) -> bool {
+        field.calculate.as_ref().is_some_and(|script| !script.text.trim().is_empty()) || calculations(&field.scripts)
+    }
+    fn nodes(children: &[Node], depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        children.iter().any(|node| match node {
+            Node::Subform(subform) => calculations(&subform.scripts) || nodes(&subform.children, depth + 1),
+            Node::Area(area) => nodes(&area.children, depth + 1),
+            Node::Field(form_field) => field(form_field),
+            Node::ExclGroup(group) => calculations(&group.scripts) || group.fields.iter().any(field),
+            Node::Draw(_) => false,
+        })
+    }
+    calculations(&tpl.root.scripts)
+        || nodes(&tpl.root.children, 1)
+        || tpl.root.page_set.as_ref().is_some_and(|page_set| page_set.areas.iter().any(|area| nodes(&area.items, 1)))
+}
+
+pub(crate) fn has_change_scripts(tpl: &Template, names: &[String], additional_names: &[String]) -> bool {
+    use pdfcraft_xfa::model::{Field, Node, Script};
+
+    fn has_activity(scripts: &[Script], activities: &[&str]) -> bool {
+        scripts.iter().any(|script| !script.text.trim().is_empty() && activities.contains(&script.activity.as_str()))
+    }
+    fn leaf(name: &str) -> &str {
+        name.rsplit('.').next().unwrap_or(name).split('[').next().unwrap_or(name)
+    }
+    fn field_needs_change(field: &Field, names: &[String], seen: &mut std::collections::HashSet<String>) -> bool {
+        if field.calculate.as_ref().is_some_and(|script| !script.text.trim().is_empty()) || has_activity(&field.scripts, &["calculate"]) {
+            return true;
+        }
+        let Some(field_name) = field.common.name.as_deref() else { return false };
+        let field_leaf = leaf(field_name);
+        seen.insert(field_leaf.to_string());
+        names.iter().any(|name| leaf(name) == field_leaf)
+            && (field.validate.as_ref().is_some_and(|script| !script.text.trim().is_empty())
+                || has_activity(&field.scripts, &["change", "exit", "validate"]))
+    }
+    fn nodes(children: &[Node], depth: usize, names: &[String], seen: &mut std::collections::HashSet<String>) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        children.iter().any(|node| match node {
+            Node::Subform(subform) => {
+                has_activity(&subform.scripts, &["change", "exit", "validate", "calculate"]) || nodes(&subform.children, depth + 1, names, seen)
+            }
+            Node::Area(area) => nodes(&area.children, depth + 1, names, seen),
+            Node::Field(form_field) => field_needs_change(form_field, names, seen),
+            Node::ExclGroup(group) => {
+                has_activity(&group.scripts, &["change", "exit", "validate", "calculate"])
+                    || group.fields.iter().any(|field| field_needs_change(field, names, seen))
+            }
+            Node::Draw(_) => false,
+        })
+    }
+    if has_activity(&tpl.root.scripts, &["change", "exit", "validate", "calculate"]) {
+        return true;
+    }
+    let names: Vec<_> = names.iter().chain(additional_names).cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    if nodes(&tpl.root.children, 1, &names, &mut seen)
+        || tpl.root.page_set.as_ref().is_some_and(|page_set| page_set.areas.iter().any(|area| nodes(&area.items, 1, &names, &mut seen)))
+    {
+        return true;
+    }
+    names.iter().any(|name| !seen.contains(leaf(name)))
+}
+
 /// After fields `names` took new values: each one's change, exit and validate scripts, then
 /// the calculations once (or only those, after a reset). A validate script that answers false,
 /// or fails, shows its message; the value stays, as Acrobat marks the field invalid rather
 /// than reverting it.
-pub(crate) fn on_changes(doc: &mut pdfcraft_cos::Document, tpl: &Template, names: &[String], run: &mut XfaRun) -> Result<(), String> {
+pub(crate) fn on_changes(
+    doc: &mut pdfcraft_cos::Document,
+    tpl: &Template,
+    names: &[String],
+    additional_names: &[String],
+    incremental: bool,
+    run: &mut XfaRun,
+) -> Result<(), String> {
     let mut r = Runner::new(doc, tpl, run, OPEN_BUDGET_MS);
     for name in names {
         let som = r.by_som().iter().find(|(_, f)| *f == name).map(|(s, _)| s.clone());
@@ -862,7 +1410,7 @@ pub(crate) fn on_changes(doc: &mut pdfcraft_cos::Document, tpl: &Template, names
             }
         }
     }
-    r.calculates()?;
+    r.calculates_after_change(names, additional_names, incremental)?;
     r.finish().map(|_| ())
 }
 
@@ -925,10 +1473,10 @@ pub(crate) fn clickable_som(doc: &pdfcraft_cos::Document, tpl: &Template, field:
     live.events.iter().any(|e| e.som == som && e.activity == "click").then_some(som)
 }
 
-/// The parsed template of a laid-out XFA form, kept for the document's life, when it has
-/// scripts to run (`None` otherwise: nothing about the form is scripted).
-pub(crate) fn template(doc: &pdfcraft_cos::Document) -> Option<Arc<Template>> {
-    pdfcraft_xfa::template_of(doc).ok().filter(pdfcraft_xfa::has_scripts).map(Arc::new)
+/// The parsed template of a laid-out XFA form, including forms without scripts, for the
+/// dataset-binding and text-layout paths that still need its SOM-to-data mapping.
+pub(crate) fn data_template(doc: &pdfcraft_cos::Document) -> Option<Arc<Template>> {
+    pdfcraft_xfa::template_of(doc).ok().map(Arc::new)
 }
 
 /// Push buttons PdfCraft generated for XFA click scripts carry no PDF action (the script is
@@ -949,6 +1497,89 @@ pub(crate) fn mark_script_buttons(doc: &pdfcraft_cos::Document, fields: &mut [pd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn field_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn simple_calculation_reads_are_tracked_by_field_som() {
+        let fields = field_set(&["form[0].first[0]", "form[0].last[0]", "form[0].full[0]"]);
+        let reads = calc_script_reads("this.rawValue = first + last;", "form[0].full[0]", &fields).unwrap();
+        assert_eq!(reads, field_set(&["form[0].first[0]", "form[0].last[0]", "form[0].full[0]"]));
+    }
+
+    #[test]
+    fn unsupported_or_side_effecting_calculations_fall_back_to_full_recalculation() {
+        let fields = field_set(&["form[0].source[0]", "form[0].other[0]", "form[0].target[0]"]);
+        assert!(calc_script_reads("xfa.resolveNode('source').rawValue", "form[0].target[0]", &fields).is_none());
+        assert!(calc_script_reads("other.rawValue = source;", "form[0].target[0]", &fields).is_none());
+        assert!(calc_script_reads("other.rawValue++;", "form[0].target[0]", &fields).is_none());
+        assert!(calc_script_reads("++other.rawValue;", "form[0].target[0]", &fields).is_none());
+        assert!(calc_script_reads("this.rawValue = unknownGlobal;", "form[0].target[0]", &fields).is_none());
+    }
+
+    #[test]
+    fn duplicate_leaf_names_need_a_qualified_reference() {
+        let fields = field_set(&["form[0].row[0].amount[0]", "form[0].row[1].amount[0]", "form[0].total[0]"]);
+        assert!(calc_script_reads("this.rawValue = amount;", "form[0].total[0]", &fields).is_none());
+    }
+
+    #[test]
+    fn qualified_field_references_match_a_unique_form_path_suffix() {
+        let fields = field_set(&["form[0].person[0].first[0]", "form[0].other[0].first[0]", "form[0].full[0]"]);
+        let reads = calc_script_reads("this.rawValue = person.first;", "form[0].full[0]", &fields).unwrap();
+        assert_eq!(reads, field_set(&["form[0].person[0].first[0]", "form[0].full[0]"]));
+    }
+
+    #[test]
+    fn changed_fields_select_transitive_calculation_dependents_only() {
+        let dependencies = |som: &str| HashSet::from([som.to_string()]);
+        let event = |som: &str| ScriptEvent {
+            som: som.to_string(),
+            activity: "calculate".to_string(),
+            script: "this.rawValue".to_string(),
+            formcalc: false,
+            message: None,
+        };
+        let plan = CalculationPlan {
+            calculations: vec![
+                Calculation { event: event("form[0].middle[0]"), dependencies: dependencies("form[0].input[0]") },
+                Calculation { event: event("form[0].result[0]"), dependencies: dependencies("form[0].middle[0]") },
+                Calculation { event: event("form[0].other[0]"), dependencies: dependencies("form[0].unrelated[0]") },
+            ],
+            som_by_name: HashMap::from([("input".to_string(), HashSet::from(["form[0].input[0]".to_string()]))]),
+            som_by_path: HashMap::new(),
+            path_by_som: HashMap::new(),
+        };
+        assert_eq!(plan.affected(&["input".to_string()]).unwrap(), HashSet::from([0, 1]));
+    }
+
+    #[test]
+    fn calculated_outputs_dirty_every_field_on_the_same_data_path() {
+        let input = "form[0].input[0]".to_string();
+        let calculated = "form[0].calculated[0]".to_string();
+        let alias = "form[0].alias[0]".to_string();
+        let result = "form[0].result[0]".to_string();
+        let shared_path = pdfcraft_xfa::data::DataPath::default();
+        let event = |som: &str| ScriptEvent {
+            som: som.to_string(),
+            activity: "calculate".to_string(),
+            script: "this.rawValue".to_string(),
+            formcalc: false,
+            message: None,
+        };
+        let plan = CalculationPlan {
+            calculations: vec![
+                Calculation { event: event(&calculated), dependencies: HashSet::from([input.clone()]) },
+                Calculation { event: event(&result), dependencies: HashSet::from([alias.clone()]) },
+            ],
+            som_by_name: HashMap::from([("input".to_string(), HashSet::from([input]))]),
+            som_by_path: HashMap::from([(shared_path.clone(), HashSet::from([calculated.clone(), alias.clone()]))]),
+            path_by_som: HashMap::from([(calculated, shared_path.clone()), (alias, shared_path)]),
+        };
+        assert_eq!(plan.affected(&["input".to_string()]).unwrap(), HashSet::from([0, 1]));
+    }
 
     #[test]
     fn script_names_match_indexed_som_paths() {

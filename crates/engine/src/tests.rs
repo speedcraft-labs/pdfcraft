@@ -5586,6 +5586,7 @@ fn active_xfa_without_template_scripts_does_not_initialize_pdf_fallback_scripts(
     let id = s.open("no-scripts.pdf", None, Arc::new(pdfcraft_xfa::fixtures::shell(template)), None).unwrap();
     assert!(s.get(id).unwrap().xfa.is_some());
     assert!(s.get(id).unwrap().xfa_template.is_none());
+    assert!(s.get(id).unwrap().xfa_data_template.is_some());
     s.apply(id, Edit::SetDocumentScript { name: "fallback".into(), script: Some("throw new Error('PDF fallback ran');".into()) }).unwrap();
     let out = s.run_javascript(id, "app.alert('Console message');", None).unwrap();
     assert!(out.error.is_none(), "{out:?}");

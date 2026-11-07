@@ -51,6 +51,10 @@ pub struct Document {
     pub xfa: Option<XfaLayout>,
     /// The parsed template of a laid-out XFA form, for its scripts.
     pub(crate) xfa_template: Option<Arc<pdfcraft_xfa::model::Template>>,
+    /// Parsed XFA template for dataset binding and layout, including forms without scripts.
+    pub(crate) xfa_data_template: Option<Arc<pdfcraft_xfa::model::Template>>,
+    /// Field values that disagreed with XFA datasets at open and must join later dirty writes.
+    pub(crate) xfa_initial_dataset_dirty: std::collections::HashSet<String>,
     /// A script of the XFA form ran away, so its scripts are off (see [`Document::xfa_scripts_off`]).
     pub(crate) xfa_scripts_off: bool,
     /// A content-only refresh keeps `info` from before the edit; an edit may have added or
@@ -177,6 +181,51 @@ pub(crate) fn undrawn_notices(prev: &pdfcraft_cos::Document, next: &pdfcraft_cos
         }
     }
     out
+}
+
+/// The form-field subset of [`undrawn_notices`], for an edit that only redrew fields named in
+/// `names`. It reads those widgets directly instead of scanning every page annotation.
+pub(crate) fn undrawn_notices_for_fields(
+    prev: &pdfcraft_cos::Document,
+    next: &pdfcraft_cos::Document,
+    form: &[pdfcraft_forms::Field],
+    names: &std::collections::HashSet<String>,
+) -> Vec<TextNotice> {
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (field_order, field) in form.iter().enumerate().filter(|(_, field)| names.contains(&field.name)) {
+        if seen.contains(field.name.as_str()) {
+            continue;
+        }
+        for (widget_order, widget) in field.widgets.iter().enumerate() {
+            let Some(page) = widget.page else { continue };
+            let now = next.get(widget.obj);
+            let Some(dict) = now.as_dict() else { continue };
+            let Some(ch) = pdfcraft_fonts::undrawn_mark(dict) else { continue };
+            let was = prev.get(widget.obj);
+            if was.as_dict().is_some_and(|old| old.get(b"AP") == dict.get(b"AP") && pdfcraft_fonts::undrawn_mark(old) == Some(ch)) {
+                continue;
+            }
+            seen.insert(field.name.as_str());
+            found.push((
+                page,
+                widget.tab,
+                field_order,
+                widget_order,
+                TextNotice { redrawn_elsewhere: false, field: Some(field.name.clone()), page, ch },
+            ));
+            break;
+        }
+    }
+    found.sort_by_key(|(page, tab, field_order, widget_order, _)| (*page, *tab, *field_order, *widget_order));
+    let redrawn_elsewhere = !found.is_empty() && pdfcraft_forms::need_appearances(next);
+    found
+        .into_iter()
+        .map(|(_, _, _, _, mut notice)| {
+            notice.redrawn_elsewhere = redrawn_elsewhere;
+            notice
+        })
+        .collect()
 }
 
 impl Document {
