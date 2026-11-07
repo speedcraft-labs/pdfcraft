@@ -17,6 +17,12 @@ fn deletes_pages(edit: &Edit) -> bool {
     }
 }
 
+/// The renderer and forms readers can differ only in spacing around a field-name token. Keep
+/// their parallel field rows aligned when updating cached renderer values.
+fn same_form_name(a: &str, b: &str) -> bool {
+    a == b || a.chars().filter(|c| !c.is_whitespace()).eq(b.chars().filter(|c| !c.is_whitespace()))
+}
+
 fn try_simple_field_edit(next: &mut pdfcraft_cos::Document, form: &[pdfcraft_forms::Field], edit: &Edit) -> Result<bool, EditError> {
     let Edit::SetFieldValue { name, value } = edit else {
         return Ok(false);
@@ -70,6 +76,16 @@ fn try_indexed_field_edit(
 impl Session {
     /// Apply an edit. On success the previous state is undoable and the view data is refreshed.
     pub fn apply(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
+        self.apply_with_form_fast_path(id, edit, true)
+    }
+
+    /// Apply an edit using the general form setter, for differential benchmarks and tests.
+    #[doc(hidden)]
+    pub fn apply_without_form_fast_path(&mut self, id: DocId, edit: Edit) -> Result<(), EditError> {
+        self.apply_with_form_fast_path(id, edit, false)
+    }
+
+    fn apply_with_form_fast_path(&mut self, id: DocId, edit: Edit, allow_form_fast_path: bool) -> Result<(), EditError> {
         let now = self.now();
         let today = self.today();
         let js_off = self.js_off;
@@ -118,7 +134,25 @@ impl Session {
         cx.redaction_overlays.clear();
         // `next` is a copy: if the edit fails or crashes, the document is unchanged.
         let mut simple_field_applied = false;
-        let fast_field_applied = if !doc.info.encrypted && doc.signatures.is_empty() && !signed {
+        let mut known_form_changes = match &edit {
+            Edit::SetFieldValue { name, .. } => {
+                let mut fields = std::collections::HashSet::new();
+                fields.insert(name.clone());
+                if js_off {
+                    fields.extend(
+                        doc.form
+                            .iter()
+                            .filter(|field| {
+                                field.actions.calculate != pdfcraft_forms::af::Calculate::None || field.actions.scripts.calculate.is_some()
+                            })
+                            .map(|field| field.name.clone()),
+                    );
+                }
+                Some(fields)
+            }
+            _ => None,
+        };
+        let fast_field_applied = if allow_form_fast_path && !doc.info.encrypted && doc.signatures.is_empty() && !signed {
             let actionful = doc.form.iter().any(|field| {
                 !field.actions.is_empty()
                     || !field.actions.unsupported.is_empty()
@@ -134,7 +168,9 @@ impl Session {
                     false
                 } else {
                     if !js_off && uses_scripts(&edit) {
-                        cx.js = Some(js::JsRunner::new(&next, &name));
+                        let mut runner = js::JsRunner::new(&next, &name);
+                        runner.calculation_cache = editor.calculation_cache.clone();
+                        cx.js = Some(runner);
                     }
                     try_indexed_field_edit(&mut next, &doc.form, &edit, cx.js.as_mut(), cx.xfa.as_deref())?
                 }
@@ -146,11 +182,16 @@ impl Session {
             false
         };
         if !fast_field_applied && !js_off && uses_scripts(&edit) {
-            cx.js = Some(js::JsRunner::new(&next, &name));
+            let mut runner = js::JsRunner::new(&next, &name);
+            runner.calculation_cache = editor.calculation_cache.clone();
+            cx.js = Some(runner);
         }
         if !fast_field_applied {
             guard(|| run_edit(&mut next, &edit, &mut cx))
                 .unwrap_or_else(|m| Err(EditError::Invalid(format!("{} failed unexpectedly ({m}); the document was not changed", edit.label()))))?;
+        }
+        if let (Some(known), Some(js)) = (known_form_changes.as_mut(), cx.js.as_ref()) {
+            known.extend(js.touched_fields.iter().cloned());
         }
         // Redaction removed what its own interpreter places under the marks. The marks were drawn
         // over the page as the renderer shows it, so the renderer has the last word.
@@ -235,6 +276,9 @@ impl Session {
                 }
             }
         }
+        if let Some(known) = known_form_changes.as_mut() {
+            known.extend(cx.xfa_changed_fields.iter().cloned());
+        }
         // XFA forms keep their values in the datasets packet too, for Adobe's viewers.
         let mut xfa_notes = Vec::new();
         if is_xfa && matches!(scope_of(&edit), Scope::Form | Scope::Full | Scope::Content) {
@@ -281,7 +325,7 @@ impl Session {
             if scope == Scope::Content {
                 Self::refresh_content(doc, Some(&edit))
             } else {
-                Self::refresh_scoped(doc, scope, Some(&edit), simple_field_applied, &cx.xfa_changed_fields)
+                Self::refresh_scoped(doc, scope, Some(&edit), simple_field_applied, &cx.xfa_changed_fields, known_form_changes.as_ref())
             }
         })
         .unwrap_or_else(|m| Err(EditError::Reopen(m)));
@@ -311,6 +355,13 @@ impl Session {
         note_warnings(&mut doc.xfa_warnings, &xfa_notes);
         let notes = doc.xfa_warnings.clone();
         note_warnings(&mut doc.info.warnings, &notes);
+        if matches!(&edit, Edit::SetFieldValue { .. }) {
+            if let Some(editor) = doc.editor.as_mut() {
+                editor.calculation_cache = cx.js.as_ref().map(|js| js.calculation_cache.clone()).unwrap_or_default();
+            }
+        } else if let Some(editor) = doc.editor.as_mut() {
+            editor.calculation_cache = js::CalculationCache::default();
+        }
         if let Some(js) = cx.js {
             doc.js_output.append(js.output);
         }
@@ -327,11 +378,13 @@ impl Session {
         let doc = self.doc_mut(id)?;
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToUndo)?;
         let (label, prev, keys, scope) = editor.undo.pop().ok_or(EditError::NothingToUndo)?;
+        editor.calculation_cache = js::CalculationCache::default();
         let current = std::mem::replace(&mut editor.cos, prev);
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.redo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false, &Default::default())).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed =
+            guard(|| Self::refresh_scoped(doc, scope, None, false, &Default::default(), None)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.redo.pop()
@@ -356,11 +409,13 @@ impl Session {
         let doc = self.doc_mut(id)?;
         let editor = doc.editor.as_mut().ok_or(EditError::NothingToRedo)?;
         let (label, next, keys, scope) = editor.redo.pop().ok_or(EditError::NothingToRedo)?;
+        editor.calculation_cache = js::CalculationCache::default();
         let current = std::mem::replace(&mut editor.cos, next);
         let current_keys = std::mem::replace(&mut editor.keys, keys);
         editor.undo.push((label.clone(), current, current_keys, scope));
         Self::adopt_keys(doc);
-        let refreshed = guard(|| Self::refresh_scoped(doc, scope, None, false, &Default::default())).unwrap_or_else(|m| Err(EditError::Reopen(m)));
+        let refreshed =
+            guard(|| Self::refresh_scoped(doc, scope, None, false, &Default::default(), None)).unwrap_or_else(|m| Err(EditError::Reopen(m)));
         if let Err(e) = refreshed {
             if let Some(ed) = doc.editor.as_mut()
                 && let Some((label, current, current_keys, scope)) = ed.undo.pop()
@@ -406,6 +461,7 @@ impl Session {
         edit: Option<&Edit>,
         simple_field_applied: bool,
         xfa_changed_fields: &std::collections::BTreeSet<String>,
+        known_form_changes: Option<&std::collections::HashSet<String>>,
     ) -> Result<(), EditError> {
         let known_xfa_fields = (simple_field_applied && doc.info.xfa.is_some()).then_some(xfa_changed_fields);
         if scope == Scope::Form
@@ -417,7 +473,7 @@ impl Session {
         }
         if scope == Scope::Form
             && let Some(edit) = edit
-            && Self::refresh_field_edit(doc, edit, known_xfa_fields)?
+            && Self::refresh_field_edit(doc, edit, known_xfa_fields, known_form_changes)?
         {
             return Ok(());
         }
@@ -565,7 +621,7 @@ impl Session {
         if let Some(field) = Arc::make_mut(&mut doc.form).get_mut(index) {
             *field = updated.clone();
         }
-        if let Some(field) = doc.info.fields.iter_mut().find(|field| field.name == *name) {
+        if let Some(field) = doc.info.fields.iter_mut().find(|field| same_form_name(&field.name, name)) {
             field.value = match updated.kind {
                 pdfcraft_forms::FieldKind::CheckBox | pdfcraft_forms::FieldKind::Radio => {
                     Some(updated.value.first().cloned().unwrap_or_else(|| "Off".into()))
@@ -587,12 +643,16 @@ impl Session {
         doc: &mut Document,
         edit: &Edit,
         xfa_changed_fields: Option<&std::collections::BTreeSet<String>>,
+        known_form_changes: Option<&std::collections::HashSet<String>>,
     ) -> Result<bool, EditError> {
         let Edit::SetFieldValue { name, .. } = edit else { return Ok(false) };
         if doc.info.encrypted || !doc.signatures.is_empty() {
             return Ok(false);
         }
-        if doc.info.fields.len() != doc.form.len() || doc.info.fields.iter().zip(doc.form.iter()).any(|(info, form)| info.name != form.name) {
+        if doc.info.fields.len() != doc.form.len() {
+            return Ok(false);
+        }
+        if doc.info.fields.iter().zip(doc.form.iter()).any(|(info, form)| !same_form_name(&info.name, &form.name)) {
             return Ok(false);
         }
         let mut changed_indices = Vec::new();
@@ -600,6 +660,9 @@ impl Session {
             let Some(editor) = doc.editor.as_ref() else { return Ok(false) };
             for (index, field) in Arc::make_mut(&mut doc.form).iter_mut().enumerate() {
                 if xfa_changed_fields.is_some_and(|names| field.name != *name && !names.contains(&field.name)) {
+                    continue;
+                }
+                if xfa_changed_fields.is_none() && known_form_changes.is_some_and(|names| !names.contains(&field.name)) {
                     continue;
                 }
                 let old_value = field.value.clone();
@@ -628,6 +691,18 @@ impl Session {
             }
         }
         if changed_indices.is_empty() && xfa_changed_fields.is_some() {
+            Self::release_working(doc);
+            let Some(editor) = doc.editor.as_ref() else { return Ok(true) };
+            let bytes = if editor.cos.is_modified() {
+                Arc::new(write_incremental(&editor.cos, &SaveOptions::default()).map_err(|error| EditError::Write(error.to_string()))?)
+            } else {
+                editor.cos.bytes().clone()
+            };
+            doc.info.file_size = bytes.len();
+            doc.bytes = bytes;
+            return Ok(true);
+        }
+        if changed_indices.is_empty() && known_form_changes.is_some() {
             Self::release_working(doc);
             let Some(editor) = doc.editor.as_ref() else { return Ok(true) };
             let bytes = if editor.cos.is_modified() {
@@ -683,7 +758,6 @@ impl Session {
             Ok(display) => Arc::new(display),
             Err(_) => return Ok(false),
         };
-
         for &index in &changed_indices {
             let field = &mut doc.info.fields[index];
             let updated = &doc.form[index];
@@ -754,10 +828,16 @@ impl Session {
             doc.marker_scan = OnceLock::new();
         }
         doc.info.file_size = bytes.len();
-        let signatures = if doc.signatures.is_empty() { Vec::new() } else { signatures_of(&editor.cos, &bytes, &doc.trust, &doc.sig_cache) };
+        let signatures = if doc.signatures.is_empty() {
+            Vec::new()
+        } else {
+            crate::signatures_after_content_edit(&editor.cos, &bytes, &doc.trust, &doc.sig_cache, &doc.signatures)
+        };
         doc.display = if display_is_source { bytes.clone() } else { display_bytes(Some(editor), &bytes) };
         doc.signatures = Arc::new(signatures);
-        doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), display_config(&doc.config));
+        let render_config = display_config(&doc.config);
+        let renderer = RenderPool::new_deferred(doc.display.clone(), render_threads(), render_config);
+        doc.renderer = renderer;
         doc.bytes = bytes;
         doc.fonts_stale = true;
         Ok(())

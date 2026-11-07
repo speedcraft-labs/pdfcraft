@@ -113,6 +113,17 @@ pub(crate) fn signatures_of(
     pdfcraft_sign::pdf::list_cached(cos, bytes, trust, cache)
 }
 
+/// Revalidate signatures after a content-only edit, keeping their unchanged page/widget locations.
+pub(crate) fn signatures_after_content_edit(
+    cos: &pdfcraft_cos::Document,
+    bytes: &[u8],
+    trust: &TrustStore,
+    cache: &pdfcraft_sign::pdf::DigestCache,
+    previous: &[SignatureInfo],
+) -> Vec<SignatureInfo> {
+    pdfcraft_sign::pdf::list_cached_after_content_edit(cos, bytes, trust, cache, previous)
+}
+
 /// What Optimize PDF did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OptimizeReport {

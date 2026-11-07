@@ -278,6 +278,7 @@ impl Session {
                 (
                     Some(Editor {
                         cos,
+                        calculation_cache: crate::js::CalculationCache::default(),
                         saved,
                         saved_keys: keys.clone(),
                         unsaved_file: false,
@@ -325,6 +326,9 @@ impl Session {
                 format!("the form's /Fields list omits {adopted} fields; they were read from the page annotations")
             };
             e.cos.note_repair(line);
+        }
+        if let Some(e) = editor.as_mut() {
+            e.calculation_cache = js::precompute_calculation_cache(&e.cos, &name);
         }
         Document {
             id: DocId(0),

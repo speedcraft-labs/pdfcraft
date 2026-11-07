@@ -357,6 +357,30 @@ pub fn reads_built_names(js: &str) -> bool {
     calculation_sites(js).iter().any(|(_, site)| *site == Site::Built)
 }
 
+/// The fields whose Acrobat flags a Calculate script may write through a literal `getField`.
+pub fn calculation_writes(js: &str) -> Vec<String> {
+    let (tokens, _) = js_tokens(js);
+    let ident = |k: usize, word: &str| tokens.get(k).is_some_and(|(range, t)| *t == Js::Ident && js.get(range.clone()) == Some(word));
+    let punct = |k: usize, c: char| tokens.get(k).is_some_and(|(_, t)| *t == Js::Punct(c));
+    let mut writes = Vec::new();
+    for k in 0..tokens.len() {
+        if !ident(k, "getField") || !punct(k + 1, '(') {
+            continue;
+        }
+        let Some((_, Js::Str(name))) = tokens.get(k + 2) else { continue };
+        if !punct(k + 3, ')') || !punct(k + 4, '.') {
+            continue;
+        }
+        let flag = ["readonly", "required", "display", "hidden"]
+            .into_iter()
+            .any(|flag| ident(k + 5, flag) && punct(k + 6, '=') && tokens.get(k + 7).is_some());
+        if flag && !writes.contains(name) {
+            writes.push(name.clone());
+        }
+    }
+    writes
+}
+
 impl Calculate {
     /// The fields it reads, each once, in the order it first names them. A name also stands for
     /// the fields under it (`row` for `row.0` and `row.1`), as [`calculate`] reads them.

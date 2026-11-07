@@ -70,10 +70,6 @@ impl FieldState {
             fill_color: None,
         }
     }
-
-    pub(crate) fn single(&self) -> String {
-        self.value.first().cloned().unwrap_or_default()
-    }
 }
 
 /// The event a script runs for.
@@ -278,6 +274,8 @@ pub struct Outcome {
     pub change: String,
     /// Fields whose value or properties the script changed, as they are now.
     pub changed: Vec<FieldState>,
+    /// Field indexes whose script-visible properties were read in this run.
+    pub observed: Vec<usize>,
     /// The messages the script showed, in order.
     pub alerts: Vec<Message>,
     pub console: Vec<String>,

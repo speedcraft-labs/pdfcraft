@@ -6,10 +6,23 @@
 //! Preferences ▸ JavaScript ▸ Enable Acrobat JavaScript is [`Session::set_javascript`]; with it
 //! off, scripts don't run and AF calls keep working natively.
 
-use pdfcraft_forms::{Field, FieldChange, FieldEvent, FieldKind, FieldProps, ScriptResult, Scripts};
+use pdfcraft_forms::{CalculationCall, Field, FieldChange, FieldEvent, FieldKind, FieldProps, ScriptResult, Scripts};
 pub use pdfcraft_js::{Limits, Message, MessageButtons, MessageIcon, Outcome, Panel, Request};
 
 use crate::{DocId, Edit, EditError, Session};
+
+#[derive(Clone, Default)]
+pub(crate) struct CalculationCache {
+    entries: std::collections::HashMap<pdfcraft_cos::ObjRef, CachedCalculation>,
+}
+
+#[derive(Clone)]
+struct CachedCalculation {
+    script: String,
+    target_value: String,
+    value: String,
+    dependencies: Vec<(usize, pdfcraft_js::FieldState)>,
+}
 
 /// What scripts produced for the viewer since it last looked.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -158,8 +171,17 @@ pub struct JsRunner {
     pub doc: pdfcraft_js::DocInfo,
     pub doc_scripts: Vec<String>,
     pub output: JsOutput,
+    /// Fields a script wrote during the current user edit, in addition to its own calculation
+    /// target. The session uses this to refresh only fields whose values or flags may have moved.
+    pub touched_fields: std::collections::HashSet<String>,
+    /// Results from a private baseline calculation, refreshed as fields change.
+    pub(crate) calculation_cache: CalculationCache,
     /// Immutable document snapshot from the start of the edit (for widget `display`).
     cos: pdfcraft_cos::Document,
+    runner: pdfcraft_js::ScriptRunner,
+    /// Field metadata and current values reused by consecutive read-only actions. A script that
+    /// changes any field invalidates this snapshot before the next action.
+    field_states: Option<std::sync::Arc<Vec<pdfcraft_js::FieldState>>>,
     // `cos` is the same immutable pre-edit snapshot for the runner's lifetime. Cache only
     // its scalar display readings, not COS objects: large forms exceed the object cache and
     // otherwise reparse every widget for every calculation. Values/flags still come from
@@ -180,7 +202,92 @@ impl JsRunner {
         // Packets alone are not enough: static XFA and an unlaid-out shell keep their scripts.
         let xfa_active = xfa && pdfcraft_xfa::existing_layout(cos).is_some();
         let doc_scripts = if xfa_active { Vec::new() } else { pdfcraft_forms::document_scripts(cos) };
-        JsRunner { doc, doc_scripts, output: JsOutput::default(), cos: cos.clone(), displays: std::collections::HashMap::new() }
+        JsRunner {
+            doc,
+            doc_scripts,
+            output: JsOutput::default(),
+            touched_fields: std::collections::HashSet::new(),
+            calculation_cache: CalculationCache::default(),
+            cos: cos.clone(),
+            runner: pdfcraft_js::ScriptRunner::new(),
+            field_states: None,
+            displays: std::collections::HashMap::new(),
+        }
+    }
+
+    fn field_states(&mut self, fields: &[Field]) -> std::sync::Arc<Vec<pdfcraft_js::FieldState>> {
+        if let Some(cached) = &self.field_states {
+            return std::sync::Arc::clone(cached);
+        }
+        let states: Vec<_> = fields
+            .iter()
+            .map(|f| {
+                let display = match f.widgets.first() {
+                    Some(w) => *self.displays.entry(w.obj).or_insert_with(|| display(&self.cos, f)),
+                    None => pdfcraft_js::DISPLAY_VISIBLE,
+                };
+                field_state_with_display(f, display)
+            })
+            .collect();
+        let states = std::sync::Arc::new(states);
+        self.field_states = Some(std::sync::Arc::clone(&states));
+        states
+    }
+
+    fn cached_calculation(&mut self, target: &Field, script: &str, value: &str, fields: &[Field]) -> Option<ScriptResult> {
+        if !self.cacheable_calculation(script) {
+            return None;
+        }
+        let cached = self.calculation_cache.entries.get(&target.obj)?.clone();
+        if cached.script != script || cached.target_value != value {
+            return None;
+        }
+        for (index, expected) in &cached.dependencies {
+            let field = fields.get(*index)?;
+            let display = match field.widgets.first() {
+                Some(w) => *self.displays.entry(w.obj).or_insert_with(|| display(&self.cos, field)),
+                None => pdfcraft_js::DISPLAY_VISIBLE,
+            };
+            if field_state_with_display(field, display) != *expected {
+                return None;
+            }
+        }
+        Some(ScriptResult { rc: true, value: cached.value, changes: Vec::new(), message: None })
+    }
+
+    fn cacheable_calculation(&self, script: &str) -> bool {
+        self.doc_scripts.is_empty() && pdfcraft_js::parallel_safe_calculation(script) && pdfcraft_forms::af::calculation_writes(script).is_empty()
+    }
+
+    fn remember_calculation(
+        &mut self,
+        target: &Field,
+        script: &str,
+        target_value: &str,
+        states: &[pdfcraft_js::FieldState],
+        observed: &[usize],
+        result: &ScriptResult,
+        cacheable: bool,
+    ) {
+        if !cacheable || !result.changes.is_empty() {
+            return;
+        }
+        let dependencies = observed.iter().filter_map(|&index| states.get(index).cloned().map(|state| (index, state))).collect();
+        self.calculation_cache.entries.insert(
+            target.obj,
+            CachedCalculation { script: script.to_owned(), target_value: target_value.to_owned(), value: result.value.clone(), dependencies },
+        );
+    }
+
+    fn script_result(&mut self, states: &[pdfcraft_js::FieldState], value: &str, o: pdfcraft_js::Outcome) -> ScriptResult {
+        self.output.absorb(&o);
+        if o.error.is_some() {
+            // As in Acrobat, a failing script leaves the value alone (the error goes to the console).
+            return ScriptResult { rc: true, value: value.to_string(), changes: Vec::new(), message: None };
+        }
+        let changes = changes(states, &o.changed);
+        self.touched_fields.extend(changes.iter().map(|change| change.name.clone()));
+        ScriptResult { rc: o.rc, value: o.value, changes, message: (!o.rc).then(|| o.alerts.last().map(|m| m.text.clone())).flatten() }
     }
 }
 
@@ -199,36 +306,96 @@ impl Scripts for JsRunner {
     /// Run field `target`'s script for `event` over the form's fields, keeping what it showed and
     /// asked for; a refusal carries its last message.
     fn run(&mut self, event: FieldEvent, script: &str, target: &Field, value: &str, fields: &[Field]) -> ScriptResult {
-        let states: Vec<_> = fields
-            .iter()
-            .map(|f| {
-                let display = match f.widgets.first() {
-                    Some(w) => *self.displays.entry(w.obj).or_insert_with(|| display(&self.cos, f)),
-                    None => pdfcraft_js::DISPLAY_VISIBLE,
-                };
-                field_state_with_display(f, display)
-            })
-            .collect();
-        let states = std::sync::Arc::new(states);
+        if event == FieldEvent::Calculate
+            && let Some(cached) = self.cached_calculation(target, script, value, fields)
+        {
+            return cached;
+        }
+        let states = self.field_states(fields);
         let ev = pdfcraft_js::Event::field(event.name(), &target.name, value);
-        let o = pdfcraft_js::run_shared(script, &ev, &self.doc, std::sync::Arc::clone(&states), &self.doc_scripts, Limits::default());
-        self.output.absorb(&o);
-        if o.error.is_some() {
-            // As in Acrobat, a failing script leaves the value alone (the error goes to the console).
-            return ScriptResult { rc: true, value: value.to_string(), changes: Vec::new(), message: None };
+        let o = self.runner.run_shared(script, &ev, &self.doc, std::sync::Arc::clone(&states), &self.doc_scripts, Limits::default());
+        let observed = o.observed.clone();
+        let cacheable = event == FieldEvent::Calculate
+            && self.cacheable_calculation(script)
+            && o.error.is_none()
+            && o.alerts.is_empty()
+            && o.console.is_empty()
+            && o.requests.is_empty();
+        let result = self.script_result(&states, value, o);
+        self.remember_calculation(target, script, value, &states, &observed, &result, cacheable);
+        result
+    }
+
+    fn fields_changed(&mut self) {
+        self.field_states = None;
+    }
+
+    fn field_written(&mut self, name: &str) {
+        self.touched_fields.insert(name.to_owned());
+    }
+
+    fn can_run_parallel(&self, script: &str) -> bool {
+        self.doc_scripts.is_empty() && pdfcraft_js::parallel_safe_calculation(script)
+    }
+
+    fn run_calculations(&mut self, calls: &[CalculationCall<'_>], fields: &[Field]) -> Vec<ScriptResult> {
+        let mut results: Vec<Option<ScriptResult>> = (0..calls.len()).map(|_| None).collect();
+        let mut misses = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            if let Some(cached) = self.cached_calculation(call.target, call.script, call.value, fields) {
+                results[index] = Some(cached);
+            } else {
+                let event = pdfcraft_js::Event::field("Calculate", &call.target.name, call.value);
+                misses.push((index, call.script.to_owned(), event));
+            }
         }
-        ScriptResult {
-            rc: o.rc,
-            value: o.value.clone(),
-            changes: changes(&states, &o.changed),
-            message: (!o.rc).then(|| o.alerts.last().map(|m| m.text.clone())).flatten(),
+        if !misses.is_empty() {
+            let states = self.field_states(fields);
+            let batch: Vec<_> = misses.iter().map(|(_, script, event)| (script.clone(), event.clone())).collect();
+            let outcomes = self.runner.run_shared_batch(&batch, &self.doc, std::sync::Arc::clone(&states), &self.doc_scripts, Limits::default());
+            for ((index, script, event), outcome) in misses.into_iter().zip(outcomes) {
+                let Some(call) = calls.get(index) else { continue };
+                let observed = outcome.observed.clone();
+                let cacheable = self.cacheable_calculation(&script)
+                    && outcome.error.is_none()
+                    && outcome.alerts.is_empty()
+                    && outcome.console.is_empty()
+                    && outcome.requests.is_empty();
+                let result = self.script_result(&states, &event.value, outcome);
+                self.remember_calculation(call.target, &script, call.value, &states, &observed, &result, cacheable);
+                results[index] = Some(result);
+            }
         }
+        results
+            .into_iter()
+            .map(|result| result.unwrap_or(ScriptResult { rc: true, value: String::new(), changes: Vec::new(), message: None }))
+            .collect()
     }
 }
 
 /// A document-level JavaScript: its name and source.
 pub fn document_scripts(cos: &pdfcraft_cos::Document) -> Vec<(String, String)> {
     pdfcraft_forms::document_scripts_named(cos)
+}
+
+/// Compute safe Calculate script baselines on a private graph while opening a regular AcroForm.
+/// The open document keeps its stored values; the cache lets later edits avoid repeating pure
+/// calculations whose field inputs have not changed.
+pub(crate) fn precompute_calculation_cache(cos: &pdfcraft_cos::Document, file_name: &str) -> CalculationCache {
+    if pdfcraft_xfa::existing_layout(cos).is_some() {
+        return CalculationCache::default();
+    }
+    let mut graph = cos.clone();
+    let mut runner = JsRunner::new(&graph, file_name);
+    if !runner.doc_scripts.is_empty() {
+        return CalculationCache::default();
+    }
+    let fields = pdfcraft_forms::fields(&graph);
+    if !fields.iter().any(|field| field.actions.scripts.calculate.is_some()) {
+        return CalculationCache::default();
+    }
+    let _ = pdfcraft_forms::recalculate_with(&mut graph, &mut runner);
+    runner.calculation_cache
 }
 
 impl crate::Document {

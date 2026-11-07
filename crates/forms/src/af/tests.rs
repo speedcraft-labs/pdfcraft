@@ -207,6 +207,15 @@ fn names_built_at_run_time_are_noticed() {
     }
 }
 
+#[test]
+fn literal_calculation_flag_writes_are_reported() {
+    assert_eq!(
+        calculation_writes("getField(\"Days1\").readonly = true; this.getField('Days2').display = display.hidden; event.value = '';"),
+        ["Days1", "Days2"]
+    );
+    assert!(calculation_writes("field.readonly = true;").is_empty(), "an aliased target is not statically known");
+}
+
 /// Scripts are read in one pass: a line of unfinished regular expressions, or calls nested in
 /// one another's field lists, don't make a rename read the rest of the script again for each.
 #[test]

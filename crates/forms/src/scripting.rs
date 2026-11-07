@@ -56,10 +56,36 @@ pub struct ScriptResult {
     pub message: Option<String>,
 }
 
+/// One calculation ready to run against the same form snapshot.
+pub struct CalculationCall<'a> {
+    pub target: &'a Field,
+    pub script: &'a str,
+    pub value: &'a str,
+}
+
 /// Runs field scripts (JavaScript).
 pub trait Scripts {
     /// Run `script` for `event` on `target`, whose value is `value`; `fields` is the whole form.
     fn run(&mut self, event: FieldEvent, script: &str, target: &Field, value: &str, fields: &[Field]) -> ScriptResult;
+
+    /// Tell a runner its field snapshot no longer describes the document. Implementations may
+    /// reuse converted field views until this is called.
+    fn fields_changed(&mut self) {}
+
+    /// Note a Calculate formula that stored a new value in its own field.
+    fn field_written(&mut self, _: &str) {}
+
+    /// Whether this calculation only reads fields and writes its own event value. The caller
+    /// also verifies its field dependencies before grouping independent calculations.
+    fn can_run_parallel(&self, _: &str) -> bool {
+        false
+    }
+
+    /// Run independent calculations over one immutable field snapshot. Script engines may
+    /// override this with parallel execution; the default preserves ordered behavior.
+    fn run_calculations(&mut self, calls: &[CalculationCall<'_>], fields: &[Field]) -> Vec<ScriptResult> {
+        calls.iter().map(|call| self.run(FieldEvent::Calculate, call.script, call.target, call.value, fields)).collect()
+    }
 }
 
 /// No script engine (or JavaScript turned off): scripts change nothing.

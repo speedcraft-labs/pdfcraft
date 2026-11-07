@@ -1,8 +1,8 @@
 use super::appearances::{declares_pdfa, need_appearances};
 use super::read::{acroform, field_flags, fields, page_refs};
 use super::{
-    Dict, Document, Field, FieldEvent, FieldKind, FieldValue, FormError, NoScripts, ObjRef, Object, PdfString, Scripts, Widget, af, appearance,
-    author, calc_order, flags, invalid, name_obj, scripting,
+    CalculationCall, Dict, Document, Field, FieldEvent, FieldKind, FieldValue, FormError, NoScripts, ObjRef, Object, PdfString, Scripts, Widget, af,
+    appearance, author, calc_order, flags, invalid, name_obj, scripting,
 };
 
 // ── writing ─────────────────────────────────────────────────────────────────────────────────
@@ -189,6 +189,8 @@ pub fn recalculate(doc: &mut Document) -> Result<usize, FormError> {
 
 /// [`recalculate`], running custom Calculate (and Format) scripts through `scripts`.
 pub fn recalculate_with(doc: &mut Document, scripts: &mut dyn Scripts) -> Result<usize, FormError> {
+    // The caller has just accepted a new input value, possibly after Keystroke/Validate scripts.
+    scripts.fields_changed();
     let mut all = fields(doc);
     if !all.iter().any(calc_order::is_calculated) {
         return Ok(0);
@@ -196,7 +198,75 @@ pub fn recalculate_with(doc: &mut Document, scripts: &mut dyn Scripts) -> Result
     // By object: two fields can share a name in a malformed form, and each calculates.
     let order: Vec<ObjRef> = calc_order::run_order(doc, &all).0.into_iter().filter_map(|(i, _)| all.get(i)).map(|f| f.obj).collect();
     let mut changed = 0;
-    for obj in order {
+    let mut position = 0;
+    while position < order.len() {
+        let mut calls = Vec::new();
+        let mut batch_targets = Vec::new();
+        let mut batch_writes = Vec::<String>::new();
+        let mut cursor = position;
+        while let Some(obj) = order.get(cursor).copied() {
+            let Some(f) = all.iter().find(|f| f.obj == obj) else {
+                cursor += 1;
+                continue;
+            };
+            let Some(js) = f.actions.scripts.calculate.as_deref() else { break };
+            let built_names = af::reads_built_names(js);
+            let parallel_safe = scripts.can_run_parallel(js);
+            if built_names || !parallel_safe {
+                break;
+            }
+            let mut reads = f.actions.calculate.reads();
+            for name in af::calculation_reads(js) {
+                if !reads.contains(&name) {
+                    reads.push(name);
+                }
+            }
+            let writes = af::calculation_writes(js);
+            let dependency_conflict = batch_targets.iter().any(|(_, name): &(ObjRef, String)| reads.iter().any(|read| fields_overlap(read, name)))
+                || batch_writes.iter().any(|name| reads.iter().any(|read| fields_overlap(read, name)))
+                || batch_targets.iter().any(|(_, name): &(ObjRef, String)| writes.iter().any(|write| fields_overlap(write, name)))
+                || writes.iter().any(|write| batch_targets.iter().any(|(_, name): &(ObjRef, String)| fields_overlap(write, name)))
+                || batch_writes.iter().any(|name| writes.iter().any(|write| fields_overlap(write, name)));
+            if dependency_conflict {
+                break;
+            }
+            let current = f.value.first().map(String::as_str).unwrap_or_default();
+            calls.push(CalculationCall { target: f, script: js, value: current });
+            batch_targets.push((obj, f.name.clone()));
+            batch_writes.extend(writes);
+            cursor += 1;
+        }
+        if calls.len() > 1 {
+            let results = scripts.run_calculations(&calls, &all);
+            drop(calls);
+            for ((obj, _), r) in batch_targets.iter().zip(results) {
+                let Some(f) = all.iter().find(|f| f.obj == *obj).cloned() else { continue };
+                scripting::apply_changes(doc, &r.changes, &f.name)?;
+                if !r.changes.is_empty() {
+                    scripts.fields_changed();
+                    all = fields(doc);
+                }
+                if !r.rc {
+                    continue;
+                }
+                let current = f.value.first().cloned().unwrap_or_default();
+                if current != r.value && matches!(f.kind, FieldKind::Text | FieldKind::Combo) {
+                    doc.update_dict(f.obj, |d| d.set(b"V".to_vec(), PdfString::text(&r.value)))?;
+                    redraw(doc, &f, std::slice::from_ref(&r.value), scripts)?;
+                    if let Some(target) = all.iter_mut().find(|x| x.obj == *obj) {
+                        target.value = vec![r.value];
+                    }
+                    scripts.fields_changed();
+                    scripts.field_written(&f.name);
+                    changed += 1;
+                }
+            }
+            position = cursor;
+            continue;
+        }
+
+        let obj = order[position];
+        position += 1;
         let Some(f) = all.iter().find(|f| f.obj == obj).cloned() else { continue };
         let lookup = |n: &str| -> Vec<String> {
             let prefix = format!("{n}.");
@@ -207,6 +277,7 @@ pub fn recalculate_with(doc: &mut Document, scripts: &mut dyn Scripts) -> Result
             let r = scripts.run(FieldEvent::Calculate, js, &f, &current, &all);
             scripting::apply_changes(doc, &r.changes, &f.name)?;
             if !r.changes.is_empty() {
+                scripts.fields_changed();
                 all = fields(doc);
             }
             if !r.rc {
@@ -223,10 +294,20 @@ pub fn recalculate_with(doc: &mut Document, scripts: &mut dyn Scripts) -> Result
             if let Some(target) = all.iter_mut().find(|x| x.obj == obj) {
                 target.value = vec![v];
             }
+            scripts.fields_changed();
+            scripts.field_written(&f.name);
             changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// Whether a read of a field name can see the calculated field at `target`, including parent
+/// groups which stand for their descendant fields.
+fn fields_overlap(read: &str, target: &str) -> bool {
+    read == target
+        || read.strip_prefix(target).is_some_and(|suffix| suffix.starts_with('.'))
+        || target.strip_prefix(read).is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 /// The fields whose calculation differs between two readings of a form, matched by field object

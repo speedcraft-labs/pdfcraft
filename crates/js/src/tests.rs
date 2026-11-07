@@ -32,6 +32,66 @@ fn calculate_scripts_read_fields_and_set_the_value() {
 }
 
 #[test]
+fn get_field_keeps_the_first_duplicate_name() {
+    let mut fields = fields();
+    fields.push(FieldState::new("qty", FieldType::Text, vec!["99".into()]));
+    let o = run("event.value = getField('qty').value;", &Event::field("Calculate", "total", ""), &doc(), &fields, &[], Limits::default());
+    assert_eq!(o.error, None);
+    assert_eq!(o.value, "4");
+}
+
+#[test]
+fn get_field_keeps_the_first_child_for_a_parent_name() {
+    let fields = vec![
+        FieldState::new("section.first", FieldType::Text, vec!["first".into()]),
+        FieldState::new("section.second", FieldType::Text, vec!["second".into()]),
+    ];
+    let o = run("event.value = getField('section').value;", &Event::field("Calculate", "total", ""), &doc(), &fields, &[], Limits::default());
+    assert_eq!(o.error, None);
+    assert_eq!(o.value, "first");
+}
+
+#[test]
+fn compact_field_views_require_only_supported_property_access() {
+    assert!(crate::document::compact_field_shape(
+        r#"var field; for (var i = 0; i < this.numFields; i++) { field = this.getField(this.getNthFieldName(i)); event.value = field.name + field.value; }"#
+    ));
+    assert!(!crate::document::compact_field_shape("event.value = getField('qty').type;"));
+    assert!(!crate::document::compact_field_shape("event.value = getField('qty')['value'];"));
+    assert!(crate::document::compact_field_shape(
+        r#"var field; for (var i = 0; i < this.numFields; i++) { field = this.getField(this.getNthFieldName(i)); if (/T1\.meta-total1$/.test(field.name)) { event.value += field.value; } }"#
+    ));
+}
+
+#[test]
+fn only_read_only_calculations_are_batchable() {
+    let summary = r#"var field; var total = 0; for (var i=0; i<this.numFields; i++) {
+        field = this.getField(this.getNthFieldName(i));
+        if (/T1\.meta-total1$/.test(field.name) && field.value.length != "") total += Number(field.value);
+    } event.value = total;"#;
+    assert!(crate::document::parallel_safe_calculation(summary));
+    assert!(crate::document::parallel_safe_calculation("event.value = Number(getField('qty').value) * 2;"));
+    assert!(crate::document::parallel_safe_calculation(
+        r#"var hours = getField('hours').valueAsString; event.value = util.printf('%.2f', Number(hours)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');"#
+    ));
+    assert!(crate::document::parallel_safe_calculation(
+        "var choice = getField('Group1').value; if (choice === 'Death') getField('Days1').readonly = true; event.value = '';"
+    ));
+    assert!(!crate::document::parallel_safe_calculation("getField('qty').value = '2'; event.value = '2';"));
+    assert!(!crate::document::parallel_safe_calculation("event.rc = false; event.value = '';"));
+    assert!(!crate::document::parallel_safe_calculation("app.alert('calculated'); event.value = '1';"));
+    assert!(!crate::document::parallel_safe_calculation("event.value = Date.now();"));
+}
+
+#[test]
+fn compact_field_view_keeps_live_value_writes() {
+    let o = go("getField('qty').value = 5; event.value = getField('qty').value;", &Event::field("Calculate", "total", ""));
+    assert_eq!(o.error, None);
+    assert_eq!(o.value, "5");
+    assert_eq!(o.changed.iter().find(|field| field.name == "qty").unwrap().value, ["5"]);
+}
+
+#[test]
 fn numbers_with_leading_zeros_stay_text() {
     let o = go("event.value = typeof getField('zip').value + ':' + typeof getField('qty').value;", &Event::field("Calculate", "total", ""));
     assert_eq!(o.value, "string:number");
@@ -356,6 +416,11 @@ fn app_alert_titles_are_clipped_and_charged() {
     // has no room for is left out and counted.
     let mut h = Host {
         fields: Arc::new(Vec::new()),
+        field_index: Default::default(),
+        parent_index: Default::default(),
+        simple_fields: false,
+        compact_field_objects: Default::default(),
+        observed: Default::default(),
         changed: BTreeSet::new(),
         alerts: Vec::new(),
         console: Vec::new(),
@@ -1802,6 +1867,19 @@ fn shared_field_snapshots_isolate_writes_errors_and_script_globals() {
     assert_eq!(read.error, None);
     assert_eq!(read.value, "undefined:4:false");
     assert!(read.changed.is_empty());
+}
+
+#[test]
+fn reusable_runner_keeps_each_script_context_isolated() {
+    let runner = ScriptRunner::new();
+    let fields = Arc::new(fields());
+    let event = Event::field("Calculate", "total", "");
+    let first = runner.run_shared("var runnerLeaked = 5; event.value = runnerLeaked;", &event, &doc(), Arc::clone(&fields), &[], Limits::default());
+    assert_eq!(first.error, None);
+    assert_eq!(first.value, "5");
+    let second = runner.run_shared("event.value = typeof runnerLeaked;", &event, &doc(), fields, &[], Limits::default());
+    assert_eq!(second.error, None);
+    assert_eq!(second.value, "undefined");
 }
 
 mod scand {

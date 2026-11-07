@@ -33,7 +33,7 @@ mod validate;
 use changes::only_grew;
 #[cfg(test)]
 use listing::{DISCOVERY_CACHE_LIMIT, is_document_timestamp};
-pub use listing::{DigestCache, list, list_cached};
+pub use listing::{DigestCache, list, list_cached, list_cached_after_content_edit};
 pub(crate) use signing::fmt;
 pub use signing::{Appearance, AppearanceLabels, SignOptions, display_date, sign, sign_with_timestamp, timestamp_document};
 pub use types::{Detail, Fill, Modification, Status, TrustStore, WORDINGS, Words, in_english, kind};

@@ -247,22 +247,32 @@ pub struct RenderPool {
     stuck_after: std::time::Duration,
     replacements_left: Mutex<usize>,
     pub(super) retired_workers: Mutex<usize>,
+    deferred_threads: Mutex<Option<usize>>,
     /// Used when threads are unavailable (wasm32 without atomics, or spawn failure): requests are
     /// rendered on the calling thread inside `try_recv`, one per call.
-    inline: Option<std::cell::RefCell<PageRenderer>>,
+    inline: Mutex<Option<std::cell::RefCell<PageRenderer>>>,
 }
 
 impl RenderPool {
     pub fn new(bytes: Arc<Vec<u8>>, threads: usize, config: RenderConfig) -> Self {
-        Self::with_mode(bytes, threads, config, false)
+        Self::with_mode(bytes, threads, config, false, false)
     }
 
-    fn with_mode(bytes: Arc<Vec<u8>>, threads: usize, config: RenderConfig, inline: bool) -> Self {
+    /// Create a pool that starts its workers on the first render request.
+    ///
+    /// Content edits use this while refreshing the document so the edit does not wait for
+    /// worker thread startup. The render request still uses the new bytes and starts the same
+    /// number of workers before waiting for a result.
+    pub fn new_deferred(bytes: Arc<Vec<u8>>, threads: usize, config: RenderConfig) -> Self {
+        Self::with_mode(bytes, threads, config, false, true)
+    }
+
+    fn with_mode(bytes: Arc<Vec<u8>>, threads: usize, config: RenderConfig, inline: bool, deferred: bool) -> Self {
         let threads = if inline || cfg!(target_arch = "wasm32") { 0 } else { threads.max(1) };
         let shared = Arc::new(Shared::default());
         let results_tx = shared.queue.clone();
         let results = ResultReceiver(shared.queue.clone());
-        let mut pool = Self {
+        let pool = Self {
             shared,
             wake: Mutex::new(Vec::new()),
             results,
@@ -273,13 +283,16 @@ impl RenderPool {
             stuck_after: STUCK_AFTER,
             replacements_left: Mutex::new(threads),
             retired_workers: Mutex::new(0),
-            inline: None,
+            deferred_threads: Mutex::new(deferred.then_some(threads)),
+            inline: Mutex::new(None),
         };
-        for _ in 0..threads {
-            pool.spawn_worker();
-        }
-        if lock(&pool._workers).is_empty() {
-            pool.inline = Some(std::cell::RefCell::new(PageRenderer::new(bytes, config)));
+        if !deferred {
+            for _ in 0..threads {
+                pool.spawn_worker();
+            }
+            if lock(&pool._workers).is_empty() {
+                *lock(&pool.inline) = Some(std::cell::RefCell::new(PageRenderer::new(bytes, config)));
+            }
         }
         pool
     }
@@ -315,17 +328,17 @@ impl RenderPool {
 
     /// A pool without worker threads: renders inside `try_recv` (the web path; also used in tests).
     pub fn new_inline(bytes: Arc<Vec<u8>>, config: RenderConfig) -> Self {
-        Self::with_mode(bytes, 0, config, true)
+        Self::with_mode(bytes, 0, config, true, false)
     }
 
     /// `true` when rendering happens on the caller's thread (no worker threads available).
     pub fn is_inline(&self) -> bool {
-        self.inline.is_some()
+        lock(&self.inline).is_some()
     }
 
     /// Snapshot the work counters collected by this pool.
     pub fn stats(&self) -> RenderStats {
-        self.inline.as_ref().map_or_else(|| self.shared.stats.snapshot(), |renderer| renderer.borrow().stats())
+        lock(&self.inline).as_ref().map_or_else(|| self.shared.stats.snapshot(), |renderer| renderer.borrow().stats())
     }
 
     /// Change the watchdog limit (tests and benchmarks).
@@ -341,13 +354,27 @@ impl RenderPool {
     /// A caller still waiting for a page (or text, or a thumbnail) must keep listing it in
     /// every call, or the finished result is dropped to save memory.
     pub fn set_queue(&self, requests: Vec<RenderRequest>) {
+        let has_requests = !requests.is_empty();
         #[cfg(not(target_arch = "wasm32"))]
         let obsolete = self.shared.queue.replace(requests);
         #[cfg(target_arch = "wasm32")]
         let _ = self.shared.queue.replace(requests);
         #[cfg(not(target_arch = "wasm32"))]
         self.shared.cancel_in_flight(&obsolete);
+        if has_requests {
+            self.start_deferred_workers();
+        }
         self.wake_workers();
+    }
+
+    fn start_deferred_workers(&self) {
+        let Some(threads) = lock(&self.deferred_threads).take() else { return };
+        for _ in 0..threads {
+            self.spawn_worker();
+        }
+        if lock(&self._workers).is_empty() {
+            *lock(&self.inline) = Some(std::cell::RefCell::new(PageRenderer::new(self.bytes.clone(), self.config.clone())));
+        }
     }
 
     fn wake_workers(&self) {
@@ -358,12 +385,14 @@ impl RenderPool {
     }
 
     pub fn try_recv(&self) -> Option<RenderedPage> {
-        if let Some(r) = &self.inline {
+        let inline = lock(&self.inline);
+        if let Some(r) = inline.as_ref() {
             let req = self.shared.queue.pop()?;
             let page = r.borrow_mut().render(req);
             self.shared.queue.finish_inline(req);
             return Some(page);
         }
+        drop(inline);
         self.watchdog();
         let page = self.results.try_recv().ok();
         // Consuming a result releases byte/count capacity. An invalid parser generation

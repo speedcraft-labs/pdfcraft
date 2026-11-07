@@ -104,6 +104,9 @@ pub(crate) type Snapshot = (Label, pdfcraft_cos::Document, Keys, Scope);
 #[derive(Clone)]
 pub(crate) struct Editor {
     pub(crate) cos: pdfcraft_cos::Document,
+    /// Read-only Calculate results from the last form snapshot. These never change the saved
+    /// document until an actual user edit uses them.
+    pub(crate) calculation_cache: crate::js::CalculationCache,
     /// The file as last opened or saved. Incremental saves append to it, and Revert opens it.
     /// Undo may restore a snapshot whose own base is an earlier revision; this does not follow it.
     pub(crate) saved: Arc<Vec<u8>>,

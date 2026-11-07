@@ -2670,6 +2670,19 @@ fn inline_pool_renders_in_priority_order() {
     assert!(pool.try_recv().is_none());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn deferred_pool_starts_workers_on_the_first_render_request() {
+    let pool = RenderPool::new_deferred(Arc::new(ONE_PAGE.to_vec()), 1, RenderConfig::default());
+    assert_eq!(pool.threads(), 0, "refreshing a document does not start render workers");
+    assert!(!pool.is_inline());
+
+    pool.set_queue(vec![RenderRequest { page: 0, kind: RequestKind::Pixels, scale: 0.5, ..Default::default() }]);
+    assert!(pool.threads() == 1 || pool.is_inline(), "the first request starts a worker or uses the inline fallback");
+    let page = receive_before_deadline(&pool);
+    assert!(page.error.is_none(), "deferred rendering succeeds: {:?}", page.error);
+}
+
 #[test]
 fn dropping_the_pool_cancels_its_renders() {
     const TEXT: &[u8] = b"%PDF-1.7

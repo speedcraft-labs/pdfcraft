@@ -55,9 +55,10 @@ pub use model::{
 use run::SCRIPT_STACK;
 use run::refuse;
 pub(crate) use run::{CheckedCodeFromStrings, MAX_SCRIPT_BYTES};
-pub use run::{run, run_shared};
+pub use run::{ScriptRunner, run, run_shared};
 
 pub mod formcalc;
+pub use document::parallel_safe_calculation;
 pub mod xfa;
 pub mod xfa_session;
 

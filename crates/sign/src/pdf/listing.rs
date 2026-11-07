@@ -265,23 +265,58 @@ pub fn list(doc: &Document, bytes: &[u8], trust: &TrustStore) -> Vec<SignatureIn
 /// [`list`], reusing digests and standalone-timestamp discovery from `cache`. Field/widget
 /// structure and validation against `bytes` and `trust` are read again on every call.
 pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &DigestCache) -> Vec<SignatureInfo> {
-    let pages = annot_pages(doc);
+    list_cached_with_previous(doc, bytes, trust, cache, None)
+}
+
+/// Revalidate signatures after a content-only edit, reusing their unchanged page and widget data.
+///
+/// The caller must have left the signature fields, widgets, page tree, and annotations unchanged.
+pub fn list_cached_after_content_edit(
+    doc: &Document,
+    bytes: &[u8],
+    trust: &TrustStore,
+    cache: &DigestCache,
+    previous: &[SignatureInfo],
+) -> Vec<SignatureInfo> {
+    list_cached_with_previous(doc, bytes, trust, cache, Some(previous))
+}
+
+fn list_cached_with_previous(
+    doc: &Document,
+    bytes: &[u8],
+    trust: &TrustStore,
+    cache: &DigestCache,
+    previous: Option<&[SignatureInfo]>,
+) -> Vec<SignatureInfo> {
+    let fields = sig_fields(doc);
+    let previous = previous.filter(|old| old.len() >= fields.len() && old.iter().zip(&fields).all(|(info, field)| info.field == field.name));
+    // Content-only edits preserve signature widgets and page order. Reusing their locations
+    // avoids a full page-tree walk on very large files just to rediscover unchanged annotations.
+    let pages = (previous.is_none() && !fields.is_empty()).then(|| annot_pages(doc));
     let mut out = Vec::new();
     let mut field_values: HashSet<ObjRef> = HashSet::new();
-    for f in sig_fields(doc) {
+    for (index, f) in fields.into_iter().enumerate() {
         if let Some(v_ref) = f.dict.get(b"V").and_then(Object::as_ref) {
             field_values.insert(v_ref);
         }
         let widget = f.widgets.first();
-        let page = widget.and_then(|(r, w)| r.and_then(|r| pages.get(&r).copied()).or_else(|| w.reference(b"P").and_then(|p| page_index(doc, p))));
-        let rect = widget
-            .and_then(|(_, w)| nums(doc, w, b"Rect"))
-            .filter(|r| r.len() == 4)
-            .map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]);
-        // Shown when it has a box, and its widget isn't Hidden (2) or NoView (32), as the forms
-        // crate reads a widget's flags.
-        let flags = widget.and_then(|(_, w)| w.get(b"F")).and_then(|o| doc.resolve(o).as_int()).unwrap_or(0);
-        let visible = rect.is_some_and(|r| r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5) && flags & (2 | 32) == 0;
+        let prior = previous.and_then(|old| old.get(index));
+        let page = prior.map(|info| info.page).unwrap_or_else(|| {
+            widget.and_then(|(r, w)| {
+                r.and_then(|r| pages.as_ref().and_then(|pages| pages.get(&r).copied())).or_else(|| w.reference(b"P").and_then(|p| page_index(doc, p)))
+            })
+        });
+        let rect = prior.map(|info| info.rect).unwrap_or_else(|| {
+            widget
+                .and_then(|(_, w)| nums(doc, w, b"Rect"))
+                .filter(|r| r.len() == 4)
+                .map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])])
+        });
+        let visible = prior.map(|info| info.visible).unwrap_or_else(|| {
+            // Shown when it has a box, and its widget isn't Hidden (2) or NoView (32), as the forms crate reads.
+            let flags = widget.and_then(|(_, w)| w.get(b"F")).and_then(|o| doc.resolve(o).as_int()).unwrap_or(0);
+            rect.is_some_and(|r| r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5) && flags & (2 | 32) == 0
+        });
         let v = f.signature(doc);
         let mut info = SignatureInfo {
             field: f.name.clone(),

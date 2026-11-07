@@ -69,7 +69,6 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn differential(path: &str) -> Result<(), Box<dyn Error>> {
-    use pdfcraft_cos::{Document, SaveOptions, write_incremental};
     use pdfcraft_forms::{Field, FieldKind};
 
     fn value(field: &Field) -> Option<FieldValue> {
@@ -77,53 +76,69 @@ fn differential(path: &str) -> Result<(), Box<dyn Error>> {
             return None;
         }
         match field.kind {
-            FieldKind::Text => Some(FieldValue::Text("1".into())),
+            FieldKind::Text => Some(FieldValue::Text(if field.value.first().is_some_and(|value| value == "1") { "2" } else { "1" }.into())),
             FieldKind::CheckBox => Some(FieldValue::Check(field.value.is_empty())),
-            FieldKind::Radio => field.widgets.iter().find_map(|widget| widget.on_state.clone()).map(|state| FieldValue::Radio(Some(state))),
-            FieldKind::Combo | FieldKind::List => field.options.first().map(|(export, _)| FieldValue::Choice(vec![export.clone()])),
+            FieldKind::Radio => field
+                .widgets
+                .iter()
+                .filter_map(|widget| widget.on_state.clone())
+                .find(|state| field.value.first() != Some(state))
+                .or_else(|| field.widgets.iter().find_map(|widget| widget.on_state.clone()))
+                .map(|state| FieldValue::Radio(Some(state))),
+            FieldKind::Combo | FieldKind::List => field
+                .options
+                .iter()
+                .find(|(export, _)| field.value.first() != Some(export))
+                .or_else(|| field.options.first())
+                .map(|(export, _)| FieldValue::Choice(vec![export.clone()])),
             FieldKind::PushButton | FieldKind::Signature => None,
         }
     }
 
     let bytes = Arc::new(std::fs::read(path)?);
-    let original = Document::open(bytes)?;
-    let all = pdfcraft_forms::fields(&original);
+    let mut fast = Session::new().with_clock(fixed_clock);
+    let fast_id = fast.open(path, None, Arc::clone(&bytes), None)?;
+    let mut slow = Session::new().with_clock(fixed_clock);
+    let slow_id = slow.open(path, None, bytes, None)?;
+    let all = fast.get(fast_id).ok_or("the fast document did not open")?.form.to_vec();
     let mut compared = 0usize;
-    let mut direct = 0usize;
-    let mut indexed = 0usize;
     let mut actionful = 0usize;
+    let mut seen = std::collections::HashSet::new();
     for field in &all {
+        if !seen.insert(field.name.clone()) {
+            continue;
+        }
         let Some(next) = value(field) else { continue };
         if !field.actions.is_empty() || !field.actions.unsupported.is_empty() {
             actionful += 1;
         }
-        let mut fast = original.clone();
-        let mut slow = original.clone();
-        let fast_result = match pdfcraft_forms::set_simple_field_value(&mut fast, &all, &field.name, &next) {
-            Ok(true) => {
-                direct += 1;
-                Ok(())
-            }
-            Ok(false) => {
-                indexed += 1;
-                pdfcraft_forms::set_value_with_fields(&mut fast, &all, &field.name, &next, &mut pdfcraft_forms::NoScripts)
-            }
-            Err(error) => Err(error),
-        };
-        let slow_result = pdfcraft_forms::set_value(&mut slow, &field.name, &next);
+        let edit = Edit::SetFieldValue { name: field.name.clone(), value: next };
+        let fast_result = fast.apply(fast_id, edit.clone());
+        let slow_result = slow.apply_without_form_fast_path(slow_id, edit);
         if format!("{fast_result:?}") != format!("{slow_result:?}") {
-            return Err(format!("fast and general setters return different results for {:?}: {fast_result:?} vs {slow_result:?}", field.name).into());
+            return Err(
+                format!("fast and general Session edits return different results for {:?}: {fast_result:?} vs {slow_result:?}", field.name).into()
+            );
         }
-        let fast_bytes = write_incremental(&fast, &SaveOptions::default())?;
-        let slow_bytes = write_incremental(&slow, &SaveOptions::default())?;
+        let fast_doc = fast.get(fast_id).ok_or("the fast document disappeared")?;
+        let slow_doc = slow.get(slow_id).ok_or("the general document disappeared")?;
+        let fast_bytes = fast_doc.bytes.as_ref();
+        let slow_bytes = slow_doc.bytes.as_ref();
         if fast_bytes != slow_bytes {
             return Err(format!("fast and general setters differ for {:?}", field.name).into());
         }
+        if format!("{:?}", fast_doc.info.fields) != format!("{:?}", slow_doc.info.fields) {
+            return Err(format!("fast and general cached field values differ for {:?}", field.name).into());
+        }
+        let fast_output = fast.take_js_output(fast_id);
+        let slow_output = slow.take_js_output(slow_id);
+        if fast_output != slow_output {
+            return Err(format!("fast and general JavaScript output differs for {:?}", field.name).into());
+        }
         compared += 1;
     }
+    println!("DIFFERENTIAL_FILE={path}");
     println!("DIFFERENTIAL_FIELDS={compared}");
-    println!("DIFFERENTIAL_DIRECT={direct}");
-    println!("DIFFERENTIAL_INDEXED={indexed}");
     println!("DIFFERENTIAL_ACTIONFUL={actionful}");
     Ok(())
 }
