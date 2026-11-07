@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cargo-fuzz-${{ github.ref }}
+  group: cargo-fuzz-${{ github.ref }}-${{ matrix.crate }}-${{ matrix.target }}
   cancel-in-progress: true
 
 jobs:
