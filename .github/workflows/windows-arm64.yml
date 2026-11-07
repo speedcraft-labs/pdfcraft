@@ -32,5 +32,6 @@ jobs:
     with:
       app-name: pdfcraft
       app-dir: PdfCraft
+      wix-version: "5.0.2"
       install-relative-path: Programs/ArtCraft/PdfCraft
       install-scope: perUser

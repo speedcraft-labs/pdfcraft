@@ -312,7 +312,7 @@ impl PdfCraftApp {
             let Some(text) = out.text else { continue };
             let hits = match d.mode {
                 SearchMode::Patterns => text.find_with(|c| pdfcraft_engine::find_pattern(d.pattern, c)),
-                _ => needles.iter().flat_map(|w| text.find_opts(w, d.case_sensitive, d.whole_words)).collect(),
+                _ => text.find_many_opts(&needles, d.case_sensitive, d.whole_words).into_iter().flatten().collect(),
             };
             for h in hits {
                 let quads: Vec<[f64; 8]> = text.line_rects(h).into_iter().map(|r| page_info.view_rect_to_quad(r)).collect();

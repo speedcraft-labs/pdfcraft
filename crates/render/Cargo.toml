@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+craft-text = { workspace = true }
 pdfcraft-cos = { workspace = true }
 pdfcraft-fonts = { workspace = true }
 hayro = { workspace = true }
@@ -29,5 +30,8 @@ bytemuck = { version = "1" }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
+craft-bench = { workspace = true }
+proptest = { workspace = true }
+regex = "1"
 # Builds the decompression-bomb streams in the raster tests.
 flate2 = { workspace = true }

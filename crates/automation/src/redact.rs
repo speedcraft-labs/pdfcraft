@@ -110,10 +110,11 @@ impl Automation {
             for (&p, text) in pages.iter().zip(&texts) {
                 let hits: Vec<(Option<usize>, _)> = match pattern {
                     Some(pat) => text.find_with(|chars| find_pattern(pat, chars)).into_iter().map(|h| (None, h)).collect(),
-                    None => needles
-                        .iter()
+                    None => text
+                        .find_many_opts(&needles, case_sensitive, whole_words)
+                        .into_iter()
                         .enumerate()
-                        .flat_map(|(i, w)| text.find_opts(w, case_sensitive, whole_words).into_iter().map(move |h| (Some(i), h)))
+                        .flat_map(|(i, hits)| hits.into_iter().map(move |h| (Some(i), h)))
                         .collect(),
                 };
                 for (word, h) in hits {
