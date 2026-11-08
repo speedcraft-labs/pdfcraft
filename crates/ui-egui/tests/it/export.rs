@@ -3,6 +3,7 @@
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use pdfcraft_ui_egui::PdfCraftApp;
+use std::time::{Duration, Instant};
 
 const FIXTURE: &[u8] = b"%PDF-1.7
 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
@@ -11,6 +12,16 @@ const FIXTURE: &[u8] = b"%PDF-1.7
 4 0 obj << /Type /Page /Parent 2 0 R >> endobj
 trailer << /Root 1 0 R >>
 %%EOF";
+
+fn wait_for_files(h: &mut Harness<'_, PdfCraftApp>, paths: &[std::path::PathBuf]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !paths.iter().all(|path| path.exists()) {
+        assert!(Instant::now() < deadline, "export did not finish writing its files");
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(4);
+}
 
 #[test]
 fn export_dialogs_write_images_and_text() {
@@ -30,16 +41,17 @@ fn export_dialogs_write_images_and_text() {
     h.run_steps(2);
     h.get_by_label("Export to Image");
     h.get_by_label("Export").click();
-    h.run_steps(4);
+    wait_for_files(&mut h, &[dir.join("doc_page_1.png"), dir.join("doc_page_2.png")]);
     assert!(dir.join("doc_page_1.png").exists() && dir.join("doc_page_2.png").exists());
     h.get_by_label_contains("Exported 2 images");
     assert!(h.state_mut().execute("export.text"));
     h.run_steps(2);
     h.get_by_label("Export").click();
-    h.run_steps(4);
+    wait_for_files(&mut h, &[dir.join("doc.txt")]);
     assert!(dir.join("doc.txt").exists());
     // Export all images: this document has none, and says so.
     assert!(h.state_mut().execute("export.all_images"));
+    h.state_mut().run_inline = true;
     h.run_steps(2);
     h.get_by_label("Export All Images");
     h.get_by_label("Export").click();
