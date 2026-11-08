@@ -68,11 +68,14 @@ fn xfa_field_datum_ref(f: &pdfcraft_forms::Field) -> pdfcraft_xfa::FieldDatum {
 pub(crate) struct XfaDatasetWarningCache {
     fields: Vec<pdfcraft_cos::ObjRef>,
     by_field: std::collections::HashMap<pdfcraft_cos::ObjRef, Vec<pdfcraft_xfa::DatasetFieldWarning>>,
-    warning_paths: Vec<pdfcraft_xfa::data::DataPath>,
+    fields_by_path: std::collections::HashMap<pdfcraft_xfa::data::DataPath, Vec<pdfcraft_cos::ObjRef>>,
+    fields_by_prefix: std::collections::HashMap<pdfcraft_xfa::data::DataPath, Vec<pdfcraft_cos::ObjRef>>,
+    fields_by_parent_name: std::collections::HashMap<(pdfcraft_xfa::data::DataPath, String), Vec<pdfcraft_cos::ObjRef>>,
 }
 
 impl XfaDatasetWarningCache {
     fn from_write(
+        doc: &pdfcraft_cos::Document,
         form: &[pdfcraft_forms::Field],
         tpl: Option<&pdfcraft_xfa::model::Template>,
         write: &pdfcraft_xfa::DatasetsWrite,
@@ -85,14 +88,32 @@ impl XfaDatasetWarningCache {
             return None;
         }
         let mut by_field: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
-        let mut warning_paths = Vec::with_capacity(field_warnings.len());
         for warning in field_warnings {
             if let Some(field) = warning.field {
                 by_field.entry(field).or_default().push(warning.clone());
-                warning_paths.push(pdfcraft_xfa::data_path(tpl, &warning.som));
             }
         }
-        Some(Self { fields: form.iter().map(|field| field.obj).collect(), by_field, warning_paths })
+        let mut fields_by_path = std::collections::HashMap::new();
+        let mut fields_by_prefix = std::collections::HashMap::new();
+        let mut fields_by_parent_name = std::collections::HashMap::new();
+        for field in form {
+            let som = doc
+                .get(field.obj)
+                .as_dict()
+                .and_then(|dict| dict.get(pdfcraft_xfa::SOM_KEY))
+                .map(|value| doc.resolve(value))
+                .and_then(|value| value.as_string().map(|value| value.to_text()))
+                .unwrap_or_else(|| field.name.clone());
+            let path = pdfcraft_xfa::data_path(tpl, &som);
+            fields_by_path.entry(path.clone()).or_insert_with(Vec::new).push(field.obj);
+            for depth in 0..=path.len() {
+                fields_by_prefix.entry(path[..depth].to_vec()).or_insert_with(Vec::new).push(field.obj);
+            }
+            if let Some((name, _)) = path.last() {
+                fields_by_parent_name.entry((path[..path.len() - 1].to_vec(), name.clone())).or_insert_with(Vec::new).push(field.obj);
+            }
+        }
+        Some(Self { fields: form.iter().map(|field| field.obj).collect(), by_field, fields_by_path, fields_by_prefix, fields_by_parent_name })
     }
 
     fn replace_fields(&mut self, fields: &std::collections::HashSet<pdfcraft_cos::ObjRef>, warnings: &[pdfcraft_xfa::DatasetFieldWarning]) {
@@ -111,27 +132,45 @@ impl XfaDatasetWarningCache {
         pdfcraft_xfa::format_field_warnings(&ordered)
     }
 
-    fn changed_path_may_affect_warnings(
+    fn fields_related_to_changes(
         &self,
         doc: &pdfcraft_cos::Document,
         tpl: &pdfcraft_xfa::model::Template,
         changed: &[pdfcraft_xfa::FieldDatum],
-    ) -> bool {
-        changed.iter().any(|field| {
-            let som = doc
-                .get(field.obj)
-                .as_dict()
-                .and_then(|dict| dict.get(pdfcraft_xfa::SOM_KEY))
-                .map(|value| doc.resolve(value))
-                .and_then(|value| value.as_string().map(|value| value.to_text()))
-                .unwrap_or_else(|| field.name.clone());
-            let path = pdfcraft_xfa::data_path(tpl, &som);
-            self.warning_paths.iter().any(|warning| {
-                let related = path.as_slice().starts_with(warning.as_slice()) || warning.as_slice().starts_with(path.as_slice());
-                let siblings = path.len() > 1 && path.len() == warning.len() && path[..path.len() - 1] == warning[..warning.len() - 1];
-                related || siblings
+    ) -> std::collections::HashSet<pdfcraft_cos::ObjRef> {
+        let changed_paths: Vec<_> = changed
+            .iter()
+            .map(|field| {
+                let som = doc
+                    .get(field.obj)
+                    .as_dict()
+                    .and_then(|dict| dict.get(pdfcraft_xfa::SOM_KEY))
+                    .map(|value| doc.resolve(value))
+                    .and_then(|value| value.as_string().map(|value| value.to_text()))
+                    .unwrap_or_else(|| field.name.clone());
+                pdfcraft_xfa::data_path(tpl, &som)
             })
-        })
+            .collect();
+        let mut related = std::collections::HashSet::new();
+        for path in changed_paths {
+            // A parent's warning can change when a descendant is written; a descendant's can
+            // change when its parent is rewritten. Same-name siblings share an indexed node
+            // group, while differently named siblings do not affect each other's diagnostics.
+            for depth in 0..=path.len() {
+                if let Some(fields) = self.fields_by_path.get(&path[..depth]) {
+                    related.extend(fields.iter().copied());
+                }
+            }
+            if let Some(fields) = self.fields_by_prefix.get(&path) {
+                related.extend(fields.iter().copied());
+            }
+            if let Some((name, _)) = path.last()
+                && let Some(fields) = self.fields_by_parent_name.get(&(path[..path.len() - 1].to_vec(), name.clone()))
+            {
+                related.extend(fields.iter().copied());
+            }
+        }
+        related
     }
 }
 
@@ -144,7 +183,7 @@ pub(crate) fn xfa_dataset_warnings(
     let data: Vec<_> = form.iter().map(xfa_field_datum_ref).collect();
     let mut warning_doc = doc.clone();
     let (write, field_warnings) = pdfcraft_xfa::write_datasets_with_details(&mut warning_doc, tpl, &data, None).map_err(|e| e.to_string())?;
-    let cache = XfaDatasetWarningCache::from_write(form, tpl, &write, &field_warnings);
+    let cache = XfaDatasetWarningCache::from_write(doc, form, tpl, &write, &field_warnings);
     Ok((cache, write.warnings))
 }
 
@@ -231,18 +270,34 @@ pub(crate) fn xfa_sync_changed_datasets(
     }
     let field_warnings = pdfcraft_xfa::format_field_warnings(&r_field_warnings);
     let changed_objects: std::collections::HashSet<_> = data.iter().map(|field| field.obj).collect();
-    let warning_path_may_change =
-        tpl.is_some_and(|tpl| cached_warnings.as_ref().is_some_and(|warnings| warnings.changed_path_may_affect_warnings(doc, tpl, &data)));
-    let previously_warned =
-        cached_warnings.as_ref().is_some_and(|warnings| changed_objects.iter().any(|field| warnings.by_field.contains_key(field)));
+    let mut diagnostic_objects = changed_objects.clone();
+    if let (Some(tpl), Some(warnings)) = (tpl, cached_warnings.as_ref()) {
+        diagnostic_objects.extend(warnings.fields_related_to_changes(doc, tpl, &data));
+    }
     if field_warnings == r.warnings
-        && r_field_warnings.is_empty()
-        && !warning_path_may_change
-        && !previously_warned
         && let Some(warnings) = cached_warnings
     {
-        warnings.replace_fields(&changed_objects, &r_field_warnings);
-        return Ok(warnings.warnings());
+        if diagnostic_objects == changed_objects {
+            warnings.replace_fields(&changed_objects, &r_field_warnings);
+            return Ok(warnings.warnings());
+        }
+        let diagnostic_data: Vec<_> = form
+            .iter()
+            .filter(|field| diagnostic_objects.contains(&field.obj))
+            .map(|field| {
+                if changed.contains(&field.name) {
+                    xfa_field_datum(pdfcraft_forms::current_field_value(doc, field))
+                } else {
+                    xfa_field_datum_ref(field)
+                }
+            })
+            .collect();
+        let (diagnostic_write, diagnostic_warnings) =
+            pdfcraft_xfa::write_datasets_with_details(&mut warning_doc, tpl, &diagnostic_data, *datasets).map_err(|e| e.to_string())?;
+        if pdfcraft_xfa::format_field_warnings(&diagnostic_warnings) == diagnostic_write.warnings {
+            warnings.replace_fields(&diagnostic_objects, &diagnostic_warnings);
+            return Ok(warnings.warnings());
+        }
     }
 
     // Warning-producing fields can share or nest datasets nodes, so their write may change the
@@ -255,7 +310,7 @@ pub(crate) fn xfa_sync_changed_datasets(
         .collect();
     let (write, field_warnings) =
         pdfcraft_xfa::write_datasets_with_details(&mut warning_doc, tpl, &all_data, *datasets).map_err(|e| e.to_string())?;
-    *cached_warnings = XfaDatasetWarningCache::from_write(form, tpl, &write, &field_warnings);
+    *cached_warnings = XfaDatasetWarningCache::from_write(&warning_doc, form, tpl, &write, &field_warnings);
     let warnings = write.warnings;
     Ok(warnings)
 }

@@ -131,7 +131,25 @@ fn apply_xfa_script_edits(
     collect(edit, &mut changed, &mut reset);
     let incremental_change = incremental_xfa && !reset && only_field_values(edit);
     if let Some(template) = cx.xfa.clone() {
-        if is_xfa && matches!(scope_of(edit), Scope::Form | Scope::Full | Scope::Content) {
+        let calculation_inputs: Vec<String> = known_form_changes.into_iter().flat_map(|names| names.iter().cloned()).collect();
+        let mut all_changed_names = changed.clone();
+        all_changed_names.extend(calculation_inputs.iter().cloned());
+        let has_som_mapping = all_changed_names.iter().any(|name| {
+            form.iter()
+                .find(|field| field.name == *name)
+                .is_some_and(|field| next.get(field.obj).as_dict().is_some_and(|dict| dict.get(pdfcraft_xfa::SOM_KEY).is_some()))
+        });
+        let has_change_work = (!changed.is_empty() || reset)
+            && if incremental_change {
+                edit_plan.as_ref().and_then(|plan| plan.needs_run(&all_changed_names)).unwrap_or_else(|| {
+                    xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
+                })
+            } else {
+                xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
+            };
+        // Scripts read the datasets, so sync before running them. With no script work, the
+        // post-edit sync below is enough and avoids parsing the data packet twice.
+        if has_change_work && is_xfa && matches!(scope_of(edit), Scope::Form | Scope::Full | Scope::Content) {
             let datasets = &mut cx.xfa_datasets;
             let mut dirty_fields: std::collections::HashSet<String> = changed.iter().cloned().collect();
             dirty_fields.extend(known_form_changes.into_iter().flat_map(|fields| fields.iter().cloned()));
@@ -149,22 +167,6 @@ fn apply_xfa_script_edits(
             .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
             .map_err(EditError::Write)?;
         }
-        let calculation_inputs: Vec<String> = known_form_changes.into_iter().flat_map(|names| names.iter().cloned()).collect();
-        let mut all_changed_names = changed.clone();
-        all_changed_names.extend(calculation_inputs.iter().cloned());
-        let has_som_mapping = all_changed_names.iter().any(|name| {
-            form.iter()
-                .find(|field| field.name == *name)
-                .is_some_and(|field| next.get(field.obj).as_dict().is_some_and(|dict| dict.get(pdfcraft_xfa::SOM_KEY).is_some()))
-        });
-        let has_change_work = (!changed.is_empty() || reset)
-            && if incremental_change {
-                edit_plan.as_ref().and_then(|plan| plan.needs_run(&all_changed_names)).unwrap_or_else(|| {
-                    xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
-                })
-            } else {
-                xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
-            };
         if has_change_work {
             let mut run = xfa::XfaRun {
                 page_count: cx.pages,
