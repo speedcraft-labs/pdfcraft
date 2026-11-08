@@ -330,20 +330,16 @@ fn viewport_precise_input_cancels_only_older_motion_on_its_axis() {
 
 fn history_search_view() -> DocView {
     let mut v = view(5, PageLayout::Single, true);
-    v.texts.insert(
-        3,
-        pdfcraft_render::PageText {
-            glyphs: vec![pdfcraft_render::TextGlyph {
-                text: "match".into(),
-                rect: [20.0, 260.0, 60.0, 280.0],
-                quad: [[20.0, 260.0], [60.0, 260.0], [60.0, 280.0], [20.0, 280.0]],
-                direction: [1.0, 0.0],
-            }],
-            line_of: vec![0],
-            space_before: vec![false],
-        }
-        .into(),
-    );
+    let mut match_text = pdfcraft_render::PageText::default();
+    match_text.glyphs = vec![pdfcraft_render::TextGlyph {
+        text: "match".into(),
+        rect: [20.0, 260.0, 60.0, 280.0],
+        quad: [[20.0, 260.0], [60.0, 260.0], [60.0, 280.0], [20.0, 280.0]],
+        direction: [1.0, 0.0],
+    }];
+    match_text.line_of = vec![0];
+    match_text.space_before = vec![false];
+    v.texts.insert(3, Arc::new(match_text));
     v.find = Some(Find { matches: vec![(3, 0..1), (3, 0..1), (1, 0..1)], current: Some(2), ..Default::default() });
     v
 }
@@ -400,14 +396,14 @@ fn automatic_search_updates_do_not_record_history_or_discard_forward() {
 
 /// One glyph per character on one line, for the search-order tests below.
 fn find_test_text(s: &str) -> PageText {
-    PageText {
-        glyphs: s
-            .chars()
-            .map(|c| pdfcraft_render::TextGlyph { text: c.into(), rect: [0.0, 0.0, 10.0, 10.0], quad: [[0.0, 0.0]; 4], direction: [1.0, 0.0] })
-            .collect(),
-        line_of: s.chars().map(|_| 0).collect(),
-        space_before: s.chars().map(|_| false).collect(),
-    }
+    let mut text = PageText::default();
+    text.glyphs = s
+        .chars()
+        .map(|c| pdfcraft_render::TextGlyph { text: c.into(), rect: [0.0, 0.0, 10.0, 10.0], quad: [[0.0, 0.0]; 4], direction: [1.0, 0.0] })
+        .collect();
+    text.line_of = s.chars().map(|_| 0).collect();
+    text.space_before = s.chars().map(|_| false).collect();
+    text
 }
 
 /// A text-layer result for `page`, for the search tests below.
@@ -1028,13 +1024,15 @@ fn a_document_copy_reads_in_page_order_and_stops_when_cancelled() {
 #[test]
 fn select_all_of_the_document_only_while_scrolling_through_several_pages() {
     let info = thumbnail_info(3);
-    let one_line = |s: &str| PageText {
-        glyphs: s
+    let one_line = |s: &str| {
+        let mut text = PageText::default();
+        text.glyphs = s
             .chars()
             .map(|c| pdfcraft_render::TextGlyph { text: c.into(), rect: [0.0, 0.0, 10.0, 10.0], quad: [[0.0, 0.0]; 4], direction: [1.0, 0.0] })
-            .collect(),
-        line_of: s.chars().map(|_| 0).collect(),
-        space_before: s.chars().map(|_| false).collect(),
+            .collect();
+        text.line_of = s.chars().map(|_| 0).collect();
+        text.space_before = s.chars().map(|_| false).collect();
+        text
     };
     let mut v = DocView::new(DocId(1), &info, ViewDefaults::default());
     for p in 0..3 {
@@ -1061,11 +1059,10 @@ fn select_all_of_the_document_only_while_scrolling_through_several_pages() {
 fn text_layers_keep_the_selection_page() {
     let info = thumbnail_info(100);
     let mut v = DocView::new(DocId(1), &info, ViewDefaults::default());
-    let text = PageText {
-        glyphs: vec![pdfcraft_render::TextGlyph { text: "x".into(), rect: [0.0, 0.0, 10.0, 10.0], quad: [[0.0, 0.0]; 4], direction: [1.0, 0.0] }],
-        line_of: vec![0],
-        space_before: vec![false],
-    };
+    let mut text = PageText::default();
+    text.glyphs = vec![pdfcraft_render::TextGlyph { text: "x".into(), rect: [0.0, 0.0, 10.0, 10.0], quad: [[0.0, 0.0]; 4], direction: [1.0, 0.0] }];
+    text.line_of = vec![0];
+    text.space_before = vec![false];
     for p in 0..100 {
         v.texts.insert(p, Arc::new(text.clone()));
     }
