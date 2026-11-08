@@ -167,7 +167,7 @@ impl PageText {
     /// The page's text in literal-search form — case folded unless `sensitive`, whitespace runs
     /// collapsed to single spaces — each character with its owning glyph index, cached across
     /// queries so only the first query per options folds (#128).
-    fn folded_form(&self, sensitive: bool) -> std::sync::Arc<Vec<(char, usize)>> {
+    fn folded_form(&self, sensitive: bool) -> std::sync::Arc<search::FoldedPage> {
         self.fold_cache.lookup_or_build(self, search::FoldOptions { sensitive })
     }
 

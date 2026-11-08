@@ -220,3 +220,53 @@ fn cached_search_over_rendered_pdf_pages_matches_the_oracle() {
         }
     }
 }
+
+#[test]
+fn search_hits_match_the_previous_algorithm_on_every_corpus_pdf_page() {
+    use pdfcraft_render::{PageRenderer, RenderConfig};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    let Ok(corpus) = std::env::var("ARTCRAFT_CORPUS") else { return };
+    fn pdfs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pdfs(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) {
+                out.push(path);
+            }
+        }
+    }
+
+    let corpus = PathBuf::from(corpus);
+    let mut files = Vec::new();
+    pdfs(&corpus, &mut files);
+    files.sort();
+    assert!(!files.is_empty(), "no PDF files in {}", corpus.display());
+    for file in files {
+        let Ok(bytes) = std::fs::read(&file) else { panic!("failed to read {}", file.display()) };
+        let mut renderer = PageRenderer::new(Arc::new(bytes), RenderConfig::default());
+        for page_index in 0..renderer.page_count() {
+            let Ok(page) = renderer.filtered_text(page_index, Default::default()) else {
+                panic!("failed to extract {} page {}", file.display(), page_index + 1)
+            };
+            let first_word = page.plain_text().split_whitespace().next().unwrap_or("absent-corpus-query").to_owned();
+            for query in ["the", "United States", first_word.as_str()] {
+                for (sensitive, whole, limit) in [(false, false, usize::MAX), (false, true, 5), (true, false, 5), (true, true, usize::MAX)] {
+                    let expected = reference(&page, query, sensitive, whole, limit);
+                    assert_eq!(
+                        page.find_opts_limited(query, sensitive, whole, limit),
+                        expected,
+                        "{} page {} query={query:?} sensitive={sensitive} whole={whole} limit={limit}",
+                        file.display(),
+                        page_index + 1
+                    );
+                }
+            }
+        }
+    }
+}

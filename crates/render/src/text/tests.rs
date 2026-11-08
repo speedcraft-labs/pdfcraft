@@ -772,7 +772,7 @@ fn phrase_search_ignores_repeated_spaces() {
     assert_eq!(t.find("quick\tbrown"), vec![0..12]);
     assert_eq!(t.find("quick"), vec![0..5]);
     assert_eq!(t.find("brown"), vec![7..12]);
-    assert_eq!(t.find_opts_limited("o", false, false, 0), Vec::new());
+    assert_eq!(t.find_opts_limited("o", false, false, 0), Vec::<std::ops::Range<usize>>::new());
     assert!(t.find("quick absent").is_empty());
 }
 
@@ -2027,7 +2027,7 @@ fn editing_one_page_rebuilds_only_its_fold() {
 fn a_fold_cache_never_exceeds_its_byte_budget() {
     let page = fold_page_of(&["needle", "in", "a", "haystack"]);
     let options = |sensitive: bool| search::FoldOptions { sensitive };
-    let one_form = search::fold_page(&page, options(false)).len() * std::mem::size_of::<(char, usize)>();
+    let one_form = search::fold_page(&page, options(false)).byte_size();
     let cache = search::FoldCache::with_budget(one_form);
     cache.lookup_or_build(&page, options(false));
     assert_eq!(cache.bytes(), one_form);
