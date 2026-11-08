@@ -1,6 +1,7 @@
 use super::dates::{data_date_pattern, data_to_iso, iso_to_data, iso_to_pattern, pattern_to_iso};
 use super::path::{data_path, parse_datasets, som_to_path};
-use super::{DataPath, Dict, Document, ObjRef, Object, Template};
+use super::{DataPath, Dict, Document, MAX_DEPTH, ObjRef, Object, Template};
+use crate::model::Node;
 
 /// What a field holds, for writing the datasets.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +86,7 @@ fn date_pattern_of(doc: &Document, f: &FieldDatum) -> Option<String> {
 
 /// A value to write: where (the field's SOM path, and the data path it binds to) and what.
 pub(super) struct Want {
+    pub(super) field: Option<ObjRef>,
     pub(super) som: String,
     pub(super) path: DataPath,
     pub(super) text: String,
@@ -111,13 +113,130 @@ pub(super) fn path_of(tpl: Option<&Template>, som: &str) -> DataPath {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PathNode {
+    Subform,
+    Area,
+    Terminal,
+}
+
+/// A template's visible SOM children by parent path. `data_path` is called once per field while
+/// syncing datasets; walking the template tree for every field made a one-field incremental
+/// update spend most of its time resolving that field's binding.
+struct DataPathIndex {
+    root: Option<String>,
+    children: std::collections::HashMap<Vec<String>, std::collections::HashMap<String, PathNode>>,
+}
+
+impl DataPathIndex {
+    fn new(tpl: &Template) -> Self {
+        fn visible(nodes: &[Node], depth: usize) -> Vec<(String, &Node)> {
+            if depth > MAX_DEPTH {
+                return Vec::new();
+            }
+            let mut names = std::collections::HashSet::new();
+            let mut found = Vec::new();
+            for node in nodes {
+                if let Some(name) = node.common().name.as_ref().filter(|name| !name.is_empty())
+                    && names.insert(name.clone())
+                {
+                    found.push((name.clone(), node));
+                }
+            }
+            for node in nodes {
+                let nested = match node {
+                    Node::Subform(subform) if subform.common.name.is_none() => Some(&subform.children),
+                    Node::Area(area) if area.common.name.is_none() => Some(&area.children),
+                    _ => None,
+                };
+                if let Some(nested) = nested {
+                    for (name, child) in visible(nested, depth + 1) {
+                        if names.insert(name.clone()) {
+                            found.push((name, child));
+                        }
+                    }
+                }
+            }
+            found
+        }
+
+        fn index_children(
+            nodes: &[Node],
+            parent: &[String],
+            index: &mut std::collections::HashMap<Vec<String>, std::collections::HashMap<String, PathNode>>,
+        ) {
+            let shown = visible(nodes, 0);
+            let entries: std::collections::HashMap<_, _> = shown
+                .iter()
+                .map(|(name, node)| {
+                    let kind = match node {
+                        Node::Subform(_) => PathNode::Subform,
+                        Node::Area(_) => PathNode::Area,
+                        _ => PathNode::Terminal,
+                    };
+                    (name.clone(), kind)
+                })
+                .collect();
+            index.insert(parent.to_vec(), entries);
+            for (name, node) in shown {
+                let children = match node {
+                    Node::Subform(subform) => Some(&subform.children),
+                    Node::Area(area) => Some(&area.children),
+                    _ => None,
+                };
+                if let Some(children) = children {
+                    let mut path = parent.to_vec();
+                    path.push(name);
+                    index_children(children, &path, index);
+                }
+            }
+        }
+
+        let root = tpl.root.common.name.clone();
+        let mut children = std::collections::HashMap::new();
+        if let Some(name) = root.as_ref() {
+            index_children(&tpl.root.children, std::slice::from_ref(name), &mut children);
+        }
+        Self { root, children }
+    }
+
+    fn data_path(&self, som: &str) -> DataPath {
+        let mut out = DataPath::new();
+        let mut parent = Vec::new();
+        let mut active = false;
+        for (i, (name, field_index)) in crate::data::som_to_path(som).into_iter().enumerate() {
+            let found = if i == 0 && self.root.as_deref() == Some(name.as_str()) {
+                active = true;
+                Some(PathNode::Subform)
+            } else if active {
+                self.children.get(&parent).and_then(|children| children.get(&name)).copied()
+            } else {
+                None
+            };
+            match found {
+                Some(PathNode::Area) => parent.push(name),
+                Some(PathNode::Subform) => {
+                    out.push((name.clone(), field_index));
+                    parent.push(name);
+                }
+                Some(PathNode::Terminal) | None => {
+                    out.push((name, field_index));
+                    active = false;
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The values the datasets should hold for `fields`, by data path: dates in each field's data
 /// picture (or ISO), check and radio states, choice values as saved.
 pub(super) fn wanted(doc: &Document, fields: &[FieldDatum], tpl: Option<&Template>) -> Vec<Want> {
     let mut out = Vec::new();
+    let paths = tpl.map(DataPathIndex::new);
     for f in fields {
         let som = som_of(doc, f);
-        let path = path_of(tpl, &som);
+        let path = paths.as_ref().map_or_else(|| path_of(tpl, &som), |paths| paths.data_path(&som));
         if path.is_empty() {
             continue;
         }
@@ -137,7 +256,7 @@ pub(super) fn wanted(doc: &Document, fields: &[FieldDatum], tpl: Option<&Templat
             FieldData::Radio(sel) => radio_dataset_value(doc, f, sel),
             FieldData::None => continue,
         };
-        out.push(Want { som, path, text, ensure: false });
+        out.push(Want { field: Some(f.obj), som, path, text, ensure: false });
     }
     out
 }

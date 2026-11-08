@@ -8,7 +8,8 @@ use pdfcraft_render::{DocInfo, OpenError, RenderConfig, RenderPool, inspect};
 use crate::history::{Editor, Keys, TextBlocksCache};
 use crate::{
     AppearanceCache, DocId, Document, Session, TrustStore, XFA_SCRIPTS_OFF, XfaLayout, display_bytes, display_config, guard, info_fields, js,
-    note_warnings, recovered_render_password, render_threads, same_pages, signatures_of, xfa, xfa_layout, xfa_values_from_datasets,
+    note_warnings, recovered_render_password, render_threads, same_pages, signatures_of, xfa, xfa_dataset_warnings, xfa_initial_dataset_dirty_fields,
+    xfa_layout, xfa_values_from_datasets,
 };
 
 /// Immutable session state needed while a document is prepared away from its owning thread.
@@ -173,10 +174,11 @@ impl Session {
         // Acrobat; what they change is one more revision, still nothing to save.
         let mut script_output = js::JsOutput::default();
         let mut ran_away = false;
-        let xfa_template = match (&xfa, &cos) {
-            (Some(_), Ok(Ok(c))) => xfa::template(c),
+        let xfa_data_template = match (info.xfa.as_ref(), &cos) {
+            (Some(_), Ok(Ok(c))) => xfa::data_template(c),
             _ => None,
         };
+        let xfa_template = xfa_data_template.clone().filter(|template| pdfcraft_xfa::has_scripts(template));
         let (bytes, info, cos) = match (&xfa, cos) {
             (Some(_), Ok(Ok(cos))) if !context.js_off => match xfa_template.clone() {
                 Some(tpl) => {
@@ -258,6 +260,21 @@ impl Session {
             Self::build_document(&context.trust, DocumentOpenData { name, path, bytes, info, structure: cos, render_password, password, xfa });
         // A script that ran away on open turns the form's scripts off for this document.
         document.xfa_template = if ran_away { None } else { xfa_template };
+        document.xfa_data_template = xfa_data_template;
+        if document.info.xfa.is_some() {
+            document.xfa_initial_dataset_dirty = document
+                .editor
+                .as_ref()
+                .map(|editor| xfa_initial_dataset_dirty_fields(&editor.cos, document.xfa_data_template.as_deref(), &document.form))
+                .unwrap_or_default();
+            document.xfa_edit_plan = document
+                .editor
+                .as_ref()
+                .and_then(|editor| document.xfa_template.as_deref().map(|template| xfa::xfa_edit_plan(&editor.cos, template)));
+            document.xfa_dataset_warnings = document.editor.as_ref().and_then(|editor| {
+                xfa_dataset_warnings(&editor.cos, document.xfa_data_template.as_deref(), &document.form).ok().and_then(|(cache, _)| cache)
+            });
+        }
         document.js_output.append(script_output);
         if ran_away {
             document.xfa_scripts_off = true;
@@ -354,6 +371,10 @@ impl Session {
             js_output: Default::default(),
             xfa,
             xfa_template: None,
+            xfa_data_template: None,
+            xfa_initial_dataset_dirty: Default::default(),
+            xfa_dataset_warnings: None,
+            xfa_edit_plan: None,
             xfa_scripts_off: false,
             fonts_stale: false,
             xfa_warnings: Vec::new(),

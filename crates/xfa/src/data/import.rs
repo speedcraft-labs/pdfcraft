@@ -166,8 +166,9 @@ pub fn write_data_image(
     }
     let ct: String = content_type.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '+')).take(64).collect();
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let ensure = [Want { som: String::new(), path: path.clone(), text: String::new(), ensure: true }];
-    rewrite(doc, &[Op::Values(&ensure), Op::Picture(path, &ct, &b64)], reuse)
+    let ensure = [Want { field: None, som: String::new(), path: path.clone(), text: String::new(), ensure: true }];
+    let mut field_warnings = Vec::new();
+    rewrite(doc, &[Op::Values(&ensure), Op::Picture(path, &ct, &b64)], reuse, &mut field_warnings)
 }
 
 /// What an import of a data file did.
@@ -236,7 +237,8 @@ pub fn import_data(doc: &mut Document, text: &str, expect_root: Option<&str>, re
     fn count(n: &[ImportNode]) -> usize {
         n.iter().map(|c| 1 + count(&c.children)).sum()
     }
-    let r = rewrite(doc, &[Op::ReplaceData(&nodes)], reuse)?;
+    let mut field_warnings = Vec::new();
+    let r = rewrite(doc, &[Op::ReplaceData(&nodes)], reuse, &mut field_warnings)?;
     if !r.written {
         return Err(XfaError::Malformed(r.warnings.first().cloned().unwrap_or_else(|| "the data could not be written".into())));
     }

@@ -20,6 +20,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
+      - name: Set runner-local Rustup home
+        run: printf 'RUSTUP_HOME=%s/rustup\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Poppler and qpdf
         run: |

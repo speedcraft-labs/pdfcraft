@@ -4,7 +4,7 @@ use super::{
     Arc, DocId, Document, Edit, EditCtx, EditError, Label, MAX_UNDO, ObjectKind, OnceLock, RenderPool, SaveOptions, Scope, Session,
     XFA_REMOVED_PREFIX, XFA_SCRIPTS_OFF, check_permission, comment_list, display_bytes, display_config, guard, info_fields, inspect, js, keys_after,
     note_warnings, render_threads, run_edit, scan_colours, scope_of, shown_under_redactions, signatures_of, sync_xfa_state, undrawn_notices,
-    uses_scripts, write_incremental, xfa, xfa_sync_datasets,
+    undrawn_notices_for_fields, uses_scripts, write_incremental, xfa, xfa_sync_changed_datasets, xfa_sync_datasets,
 };
 use crate::{EditNotice, MarkKind};
 
@@ -13,10 +13,21 @@ struct FastFormPathConfig<'a> {
     encrypted: bool,
     has_signatures: bool,
     signed: bool,
-    is_xfa: bool,
     js_off: bool,
     name: &'a str,
     calculation_cache: &'a js::CalculationCache,
+    data_template: Option<&'a pdfcraft_xfa::model::Template>,
+}
+
+struct XfaScriptEditConfig<'a> {
+    is_xfa: bool,
+    incremental: bool,
+    known_form_changes: Option<&'a std::collections::HashSet<String>>,
+    form: &'a [pdfcraft_forms::Field],
+    data_template: Option<&'a pdfcraft_xfa::model::Template>,
+    edit_plan: Option<Arc<xfa::XfaEditPlan>>,
+    initial_dataset_dirty: &'a std::collections::HashSet<String>,
+    dataset_warnings: &'a mut Option<crate::xfa_form::XfaDatasetWarningCache>,
 }
 
 fn apply_fast_form_path(
@@ -38,18 +49,12 @@ fn apply_fast_form_path(
                 || field.actions.scripts.calculate.is_some()
         });
         if actionful {
-            // XFA's date-pattern retry must use the complete setter and rebuild its field
-            // snapshot after a format refusal. Keep that specialized path on the slow setter.
-            if config.is_xfa {
-                false
-            } else {
-                if !config.js_off && uses_scripts(edit) {
-                    let mut runner = js::JsRunner::new(next, config.name);
-                    runner.calculation_cache = config.calculation_cache.clone();
-                    cx.js = Some(runner);
-                }
-                try_indexed_field_edit(next, form, edit, cx.js.as_mut(), cx.xfa.as_deref())?
+            if !config.js_off && uses_scripts(edit) {
+                let mut runner = js::JsRunner::new(next, config.name);
+                runner.calculation_cache = config.calculation_cache.clone();
+                cx.js = Some(runner);
             }
+            try_indexed_field_edit(next, form, edit, cx.js.as_mut(), cx.xfa.as_deref().or(config.data_template))?
         } else {
             simple_field_applied = try_simple_field_edit(next, form, edit)?;
             simple_field_applied
@@ -93,30 +98,76 @@ fn apply_xfa_script_edits(
     next: &mut pdfcraft_cos::Document,
     edit: &Edit,
     cx: &mut EditCtx,
-    is_xfa: bool,
+    config: XfaScriptEditConfig<'_>,
     scope: &mut Scope,
-    form: &[pdfcraft_forms::Field],
 ) -> Result<Vec<String>, EditError> {
+    let XfaScriptEditConfig {
+        is_xfa,
+        incremental: incremental_xfa,
+        known_form_changes,
+        form,
+        data_template,
+        edit_plan,
+        initial_dataset_dirty,
+        dataset_warnings,
+    } = config;
+    fn collect(edit: &Edit, changed: &mut Vec<String>, reset: &mut bool) {
+        match edit {
+            Edit::SetFieldValue { name, .. } => changed.push(name.clone()),
+            Edit::ResetForm { .. } => *reset = true,
+            Edit::Batch { edits, .. } => edits.iter().for_each(|edit| collect(edit, changed, reset)),
+            _ => {}
+        }
+    }
+    fn only_field_values(edit: &Edit) -> bool {
+        match edit {
+            Edit::SetFieldValue { .. } => true,
+            Edit::Batch { edits, .. } => !edits.is_empty() && edits.iter().all(only_field_values),
+            _ => false,
+        }
+    }
+    let mut changed = Vec::new();
+    let mut reset = false;
+    collect(edit, &mut changed, &mut reset);
+    let incremental_change = incremental_xfa && !reset && only_field_values(edit);
     if let Some(template) = cx.xfa.clone() {
-        if is_xfa && matches!(scope_of(edit), Scope::Form | Scope::Full | Scope::Content) {
+        let calculation_inputs: Vec<String> = known_form_changes.into_iter().flat_map(|names| names.iter().cloned()).collect();
+        let mut all_changed_names = changed.clone();
+        all_changed_names.extend(calculation_inputs.iter().cloned());
+        let has_som_mapping = all_changed_names.iter().any(|name| {
+            form.iter()
+                .find(|field| field.name == *name)
+                .is_some_and(|field| next.get(field.obj).as_dict().is_some_and(|dict| dict.get(pdfcraft_xfa::SOM_KEY).is_some()))
+        });
+        let has_change_work = (!changed.is_empty() || reset)
+            && if incremental_change {
+                edit_plan.as_ref().and_then(|plan| plan.needs_run(&all_changed_names)).unwrap_or_else(|| {
+                    xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
+                })
+            } else {
+                xfa::has_calculation_scripts(&template) || (has_som_mapping && xfa::has_change_scripts(&template, &changed, &calculation_inputs))
+            };
+        // Scripts read the datasets, so sync before running them. With no script work, the
+        // post-edit sync below is enough and avoids parsing the data packet twice.
+        if has_change_work && is_xfa && matches!(scope_of(edit), Scope::Form | Scope::Full | Scope::Content) {
             let datasets = &mut cx.xfa_datasets;
-            let notes = guard(|| xfa_sync_datasets(next, Some(&template), datasets))
-                .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
-                .map_err(EditError::Write)?;
-            cx.xfa_out.errors.extend(notes);
-        }
-        fn collect(edit: &Edit, changed: &mut Vec<String>, reset: &mut bool) {
-            match edit {
-                Edit::SetFieldValue { name, .. } => changed.push(name.clone()),
-                Edit::ResetForm { .. } => *reset = true,
-                Edit::Batch { edits, .. } => edits.iter().for_each(|edit| collect(edit, changed, reset)),
-                _ => {}
+            let mut dirty_fields: std::collections::HashSet<String> = changed.iter().cloned().collect();
+            dirty_fields.extend(known_form_changes.into_iter().flat_map(|fields| fields.iter().cloned()));
+            dirty_fields.extend(initial_dataset_dirty.iter().cloned());
+            let incremental_sync = incremental_change && *scope != Scope::Full;
+            let _pre_script_notes = if incremental_sync {
+                guard(|| xfa_sync_changed_datasets(next, data_template.or(Some(&template)), datasets, form, &dirty_fields, dataset_warnings))
+            } else {
+                guard(|| {
+                    let notes = xfa_sync_datasets(next, data_template.or(Some(&template)), datasets)?;
+                    *dataset_warnings = None;
+                    Ok(notes)
+                })
             }
+            .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
+            .map_err(EditError::Write)?;
         }
-        let mut changed = Vec::new();
-        let mut reset = false;
-        collect(edit, &mut changed, &mut reset);
-        if !changed.is_empty() || reset {
+        if has_change_work {
             let mut run = xfa::XfaRun {
                 page_count: cx.pages,
                 out: &mut cx.xfa_out,
@@ -126,7 +177,7 @@ fn apply_xfa_script_edits(
                 ran_away: false,
                 time_scale: cx.xfa_time_scale,
             };
-            let ran = guard(|| xfa::on_changes(next, &template, &changed, &mut run))
+            let ran = guard(|| xfa::on_changes(next, &template, &changed, &calculation_inputs, incremental_change, edit_plan.clone(), &mut run))
                 .unwrap_or_else(|m| Err(format!("the form's scripts failed unexpectedly ({m})")));
             cx.xfa_datasets = run.datasets;
             cx.xfa_changed_fields.extend(std::mem::take(&mut run.changed_fields));
@@ -141,13 +192,35 @@ fn apply_xfa_script_edits(
     }
     let mut notes = Vec::new();
     if is_xfa && matches!(scope_of(edit), Scope::Form | Scope::Full | Scope::Content) {
-        let (template, datasets) = (cx.xfa.as_deref(), &mut cx.xfa_datasets);
-        notes = guard(|| xfa_sync_datasets(next, template, datasets))
-            .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
-            .map_err(EditError::Write)?;
+        let (script_template, datasets) = (cx.xfa.as_deref(), &mut cx.xfa_datasets);
+        let data_template = data_template.or(script_template);
+        let dirty_fields = if incremental_change && *scope != Scope::Full {
+            let mut names: std::collections::HashSet<String> = changed.iter().cloned().collect();
+            names.extend(cx.xfa_changed_fields.iter().cloned());
+            names.extend(known_form_changes.into_iter().flat_map(|fields| fields.iter().cloned()));
+            names.extend(initial_dataset_dirty.iter().cloned());
+            Some(names)
+        } else {
+            None
+        };
+        notes = if let Some(names) = dirty_fields.as_ref() {
+            guard(|| xfa_sync_changed_datasets(next, data_template, datasets, form, names, dataset_warnings))
+        } else {
+            guard(|| {
+                let notes = xfa_sync_datasets(next, data_template, datasets)?;
+                *dataset_warnings = None;
+                Ok(notes)
+            })
+        }
+        .unwrap_or_else(|m| Err(format!("writing the XFA data failed unexpectedly ({m})")))
+        .map_err(EditError::Write)?;
+        // The pre-script sync can report transient warnings that calculations later resolve.
+        // The full path reports the final dataset state, so expose only these post-script notes.
+        cx.xfa_out.errors.extend(notes.iter().cloned());
         // Rebuilding from stale data would discard accepted widget values.
         if notes.is_empty() {
-            let reflow = guard(|| xfa::relayout_changed_text(next, template, form))
+            let changed_layout_names = dirty_fields;
+            let reflow = guard(|| xfa::relayout_changed_text(next, data_template, form, changed_layout_names.as_ref()))
                 .unwrap_or_else(|m| Err(format!("laying out the XFA text failed unexpectedly ({m})")))
                 .map_err(EditError::Write)?;
             if let Some(warnings) = reflow {
@@ -211,7 +284,7 @@ fn try_indexed_field_edit(
             // general setter rereads the form for the typed-date retry; keep the indexed path in
             // step with it instead of reusing the pre-attempt snapshot.
             let retry_fields = pdfcraft_forms::fields(next);
-            let retry = match scripts.as_deref_mut() {
+            let retry = match scripts {
                 Some(scripts) => guard(|| pdfcraft_forms::set_value_with_fields(next, &retry_fields, name, &typed, scripts)),
                 None => guard(|| pdfcraft_forms::set_value_with_fields(next, &retry_fields, name, &typed, &mut pdfcraft_forms::NoScripts)),
             };
@@ -247,6 +320,9 @@ impl Session {
         doc.edit_notices.clear();
         let name = doc.name.clone();
         let is_xfa = doc.info.xfa.is_some();
+        let xfa_data_template = doc.xfa_data_template.clone();
+        let mut xfa_dataset_warnings = doc.xfa_dataset_warnings.clone();
+        let xfa_edit_plan = doc.xfa_edit_plan.clone();
         let mut scope = scope_of(&edit);
         let mut cx = EditCtx::new(now, doc.generation ^ (id.0 << 48));
         if !js_off {
@@ -315,10 +391,10 @@ impl Session {
                 encrypted: doc.info.encrypted,
                 has_signatures: !doc.signatures.is_empty(),
                 signed,
-                is_xfa,
                 js_off,
                 name: &name,
                 calculation_cache: &editor.calculation_cache,
+                data_template: xfa_data_template.as_deref(),
             },
         )?;
         // Redaction removed what its own interpreter places under the marks. The marks were drawn
@@ -355,7 +431,22 @@ impl Session {
         // An XFA form's scripts answer the change: exit and validate scripts of the field, then
         // every calculation (and a reset recalculates). They read the data, so it is brought up
         // to date first.
-        let xfa_notes = apply_xfa_script_edits(&mut next, &edit, &mut cx, is_xfa, &mut scope, &doc.form)?;
+        let xfa_notes = apply_xfa_script_edits(
+            &mut next,
+            &edit,
+            &mut cx,
+            XfaScriptEditConfig {
+                is_xfa,
+                incremental: allow_form_fast_path,
+                known_form_changes: known_form_changes.as_ref(),
+                form: &doc.form,
+                data_template: xfa_data_template.as_deref(),
+                edit_plan: xfa_edit_plan.clone(),
+                initial_dataset_dirty: &doc.xfa_initial_dataset_dirty,
+                dataset_warnings: &mut xfa_dataset_warnings,
+            },
+            &mut scope,
+        )?;
         if let Some(known) = known_form_changes.as_mut() {
             known.extend(cx.xfa_changed_fields.iter().cloned());
         }
@@ -371,7 +462,7 @@ impl Session {
         if signed && ((rewrites(&next) && !rewrites(&editor.cos)) || (next.is_modified() && next.revisions().is_empty())) {
             return Err(EditError::SignedRewrite(edit.label().to_string()));
         }
-        let notices = edit_notices(&edit, &editor.cos, &next);
+        let notices = edit_notices(&edit, &editor.cos, &next, scope, &doc.form, known_form_changes.as_ref());
         let previous = std::mem::replace(&mut editor.cos, next);
         let keys = keys_after(&edit).unwrap_or_else(|| editor.keys.clone());
         let previous_keys = std::mem::replace(&mut editor.keys, keys);
@@ -431,6 +522,8 @@ impl Session {
             doc.xfa_scripts_off = true;
             doc.js_output.errors.push(XFA_SCRIPTS_OFF.into());
         }
+        doc.xfa_dataset_warnings = xfa_dataset_warnings;
+        doc.xfa_edit_plan = if scope == Scope::Full || cx.xfa_ran_away { None } else { xfa_edit_plan };
         Ok(())
     }
 
@@ -462,6 +555,10 @@ impl Session {
         doc.edit_notices.clear();
         Self::sync_dirty(doc);
         doc.generation += 1;
+        doc.xfa_dataset_warnings = None;
+        if scope == Scope::Full {
+            doc.xfa_edit_plan = None;
+        }
         Ok(label)
     }
 
@@ -493,6 +590,10 @@ impl Session {
         doc.edit_notices.clear();
         Self::sync_dirty(doc);
         doc.generation += 1;
+        doc.xfa_dataset_warnings = None;
+        if scope == Scope::Full {
+            doc.xfa_edit_plan = None;
+        }
         Ok(label)
     }
 
@@ -727,11 +828,8 @@ impl Session {
                 }
                 let old_value = field.value.clone();
                 let old_flags = field.flags;
-                let old_widgets: Vec<_> = field
-                    .widgets
-                    .iter()
-                    .map(|widget| (widget.state.clone(), widget.locked, widget.hidden, widget.read_only, widget.list.clone()))
-                    .collect();
+                let old_widgets: Vec<_> =
+                    field.widgets.iter().map(|widget| (widget.state.clone(), widget.locked, widget.hidden, widget.read_only, widget.list)).collect();
                 pdfcraft_forms::refresh_field_value(&editor.cos, field);
                 if field.flags != old_flags
                     || field
@@ -988,9 +1086,18 @@ impl Session {
 }
 
 /// What `edit`, taking `prev` to `next`, wants said: never silent (AGENTS.md §4).
-fn edit_notices(edit: &Edit, prev: &pdfcraft_cos::Document, next: &pdfcraft_cos::Document) -> Vec<EditNotice> {
+fn edit_notices(
+    edit: &Edit,
+    prev: &pdfcraft_cos::Document,
+    next: &pdfcraft_cos::Document,
+    scope: Scope,
+    form: &[pdfcraft_forms::Field],
+    known_form_changes: Option<&std::collections::HashSet<String>>,
+) -> Vec<EditNotice> {
     // What it drew with `?` (a value or comment text its font can't draw, stored as typed).
-    let mut notices: Vec<EditNotice> = if matches!(scope_of(edit), Scope::Form | Scope::Comments | Scope::Full) {
+    let mut notices: Vec<EditNotice> = if let (Scope::Form, Some(changed_fields)) = (scope, known_form_changes) {
+        guard(|| undrawn_notices_for_fields(prev, next, form, changed_fields)).unwrap_or_default().into_iter().map(EditNotice::Undrawn).collect()
+    } else if matches!(scope_of(edit), Scope::Form | Scope::Comments | Scope::Full) {
         guard(|| undrawn_notices(prev, next)).unwrap_or_default().into_iter().map(EditNotice::Undrawn).collect()
     } else {
         Vec::new()

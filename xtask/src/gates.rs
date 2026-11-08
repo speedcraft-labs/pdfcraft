@@ -523,10 +523,10 @@ pub fn render_oracle(args: &[String]) -> anyhow::Result<()> {
                 regressions.push(format!("{name}: no comparable score (missing or unreadable input)"));
             }
             for (name, now) in &per_file {
-                if let Some(before) = old.get(name).and_then(serde_json::Value::as_f64) {
-                    if *now > before + 0.05 {
-                        regressions.push(format!("{name}: {before:.3}% -> {now:.3}%"));
-                    }
+                if let Some(before) = old.get(name).and_then(serde_json::Value::as_f64)
+                    && *now > before + 0.05
+                {
+                    regressions.push(format!("{name}: {before:.3}% -> {now:.3}%"));
                 }
             }
             if old.is_empty() {

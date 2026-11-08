@@ -40,9 +40,20 @@ pub use values::{FieldData, FieldDatum, is_on, read_values, read_values_with};
 #[cfg(test)]
 pub(crate) use write::ENSURED;
 pub use write::{
-    DatasetsWrite, add_data_instances, remove_data_instance, write_data_ops, write_data_value, write_datasets, write_datasets_reusing,
-    write_datasets_with,
+    DatasetsWrite, add_data_instances, format_field_warnings, remove_data_instance, unsynced_soms_with, write_data_ops, write_data_value,
+    write_datasets, write_datasets_reusing, write_datasets_with, write_datasets_with_details,
 };
+
+/// One field whose value could not be written to the datasets packet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetFieldWarning {
+    /// The field object that produced the warning, when a field produced it.
+    pub field: Option<ObjRef>,
+    /// The grouped warning kind.
+    pub reason: String,
+    /// The field's XFA SOM path as reported to callers.
+    pub som: String,
+}
 
 const XFA_DATA_NS: &str = "http://www.xfa.org/schema/xfa-data/1.0/";
 /// Most data nodes read.

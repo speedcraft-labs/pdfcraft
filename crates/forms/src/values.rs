@@ -26,7 +26,7 @@ pub fn set_value_with_fields(doc: &mut Document, all: &[Field], name: &str, valu
         return Err(FormError::NoForm);
     }
     let named: Vec<usize> = all.iter().enumerate().filter(|(_, f)| f.name == name).map(|(i, _)| i).collect();
-    fill(doc, &all, &named, name, value, scripts)?;
+    fill(doc, all, &named, name, value, scripts)?;
     recalculate_with(doc, scripts)?;
     Ok(())
 }

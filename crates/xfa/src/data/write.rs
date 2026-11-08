@@ -1,8 +1,10 @@
-use super::build::{MAX_INDEX, build_children, fresh_datasets};
+use super::build::{MAX_INDEX, build_children, fresh_datasets, skipped};
 use super::merge::{Op, Within, merge_all, readable};
 use super::path::path_som;
 use super::values::{FieldDatum, Want, wanted, with_template};
-use super::{DataOp, DataPath, Dict, Document, Encoding, HashMap, ObjRef, Object, PdfString, Stream, Template, XfaError, encode};
+use super::{
+    DataOp, DataPath, DatasetFieldWarning, Dict, Document, Encoding, HashMap, ObjRef, Object, PdfString, Stream, Template, XfaError, encode,
+};
 
 /// What [`write_datasets`] did.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -13,6 +15,17 @@ pub struct DatasetsWrite {
     pub warnings: Vec<String>,
     /// The datasets stream written, when one was.
     pub stream: Option<ObjRef>,
+}
+
+/// Format the grouped warning text from per-field warning details.
+pub fn format_field_warnings(field_warnings: &[DatasetFieldWarning]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for warning in field_warnings {
+        if warning.field.is_some() {
+            skipped(&mut warnings, &warning.reason, &warning.som);
+        }
+    }
+    warnings
 }
 
 /// A packet stream's text and encoding; `None` (with a warning) when it can't be read exactly.
@@ -57,8 +70,41 @@ pub fn write_datasets_with(
     fields: &[FieldDatum],
     reuse: Option<ObjRef>,
 ) -> Result<DatasetsWrite, XfaError> {
+    write_datasets_with_details(doc, tpl, fields, reuse).map(|(write, _)| write)
+}
+
+/// [`write_datasets_with`] with ungrouped, per-field warning details for incremental callers.
+pub fn write_datasets_with_details(
+    doc: &mut Document,
+    tpl: Option<&Template>,
+    fields: &[FieldDatum],
+    reuse: Option<ObjRef>,
+) -> Result<(DatasetsWrite, Vec<DatasetFieldWarning>), XfaError> {
     let wants = with_template(doc, tpl, |t| wanted(doc, fields, t));
-    rewrite(doc, &[Op::Values(&wants)], reuse)
+    let mut field_warnings = Vec::new();
+    let write = rewrite(doc, &[Op::Values(&wants)], reuse, &mut field_warnings)?;
+    Ok((write, field_warnings))
+}
+
+/// The SOMs whose current field values would change the datasets packet if a full write ran.
+/// This lets callers remember pre-existing data/field differences before switching to dirty
+/// writes for individual edits.
+pub fn unsynced_soms_with(doc: &Document, tpl: Option<&Template>, fields: &[FieldDatum]) -> Vec<String> {
+    let wants = with_template(doc, tpl, |t| wanted(doc, fields, t));
+    let data = crate::read_packets(doc).ok().flatten().and_then(|packets| crate::parse_datasets(&packets.xdp));
+    let Some(data) = data else {
+        // With no readable data tree, the full writer must still build the initial packet from
+        // every field, including empty values that supply its element structure.
+        return wants.into_iter().map(|want| want.som).collect();
+    };
+    wants
+        .into_iter()
+        .filter(|want| {
+            let existing = data.value_at(&want.path);
+            existing.as_deref() != Some(want.text.as_str()) && (existing.is_some() || !want.text.is_empty() || want.ensure)
+        })
+        .map(|want| want.som)
+        .collect()
 }
 
 /// Make sure the data has at least `count` instances of `name` under `parent` (a script added
@@ -113,7 +159,7 @@ pub fn write_data_ops(doc: &mut Document, ops: &[DataOp], reuse: Option<ObjRef>)
         match op {
             DataOp::Value { path, text } if !path.is_empty() => {
                 // An empty value clears an existing node and needs no new one.
-                run.push(Want { som: path_som(path), path: path.clone(), text: text.clone(), ensure: false });
+                run.push(Want { field: None, som: path_som(path), path: path.clone(), text: text.clone(), ensure: false });
             }
             DataOp::Instances { parent, name, count } => {
                 let done = queued.entry((parent, name.as_str())).or_insert(0);
@@ -129,7 +175,7 @@ pub fn write_data_ops(doc: &mut Document, ops: &[DataOp], reuse: Option<ObjRef>)
                     *done += 1;
                     let mut path = parent.clone();
                     path.push((name.clone(), k));
-                    run.push(Want { som: format!("{name}[{k}]"), path, text: String::new(), ensure: true });
+                    run.push(Want { field: None, som: format!("{name}[{k}]"), path, text: String::new(), ensure: true });
                 }
             }
             DataOp::Remove(path) if !path.is_empty() => {
@@ -150,7 +196,8 @@ pub fn write_data_ops(doc: &mut Document, ops: &[DataOp], reuse: Option<ObjRef>)
             None => Op::Values(w),
         })
         .collect();
-    let mut written = rewrite(doc, &plan, reuse)?;
+    let mut field_warnings = Vec::new();
+    let mut written = rewrite(doc, &plan, reuse, &mut field_warnings)?;
     if capped {
         written.warnings.push(format!("XFA data instances not written past {MAX_ENSURED}: the rows were added and removed too often"));
     }
@@ -173,7 +220,12 @@ fn put_stream(doc: &mut Document, old: Option<&Object>, reuse: Option<ObjRef>, b
 /// Longest packet text written (the packets together are read up to 64 MB).
 pub(super) const MAX_PACKET_WRITE: usize = 48 << 20;
 
-pub(super) fn rewrite(doc: &mut Document, ops: &[Op], reuse: Option<ObjRef>) -> Result<DatasetsWrite, XfaError> {
+pub(super) fn rewrite(
+    doc: &mut Document,
+    ops: &[Op],
+    reuse: Option<ObjRef>,
+    field_warnings: &mut Vec<DatasetFieldWarning>,
+) -> Result<DatasetsWrite, XfaError> {
     let mut report = DatasetsWrite::default();
     if ops.is_empty() {
         return Ok(report);
@@ -195,7 +247,7 @@ pub(super) fn rewrite(doc: &mut Document, ops: &[Op], reuse: Option<ObjRef>) -> 
                 Some(i) => {
                     let Some(existing) = items.get(i + 1).cloned() else { return Ok(report) };
                     let Some((text, encoding)) = packet_text(doc, &existing, warnings) else { return Ok(report) };
-                    let Some(t) = merge_all(&text, Within::Packet, ops, warnings) else { return Ok(report) };
+                    let Some(t) = merge_all(&text, Within::Packet, ops, warnings, field_warnings) else { return Ok(report) };
                     if !readable(&t, Within::Packet, warnings) {
                         return Ok(report);
                     }
@@ -210,8 +262,8 @@ pub(super) fn rewrite(doc: &mut Document, ops: &[Op], reuse: Option<ObjRef>) -> 
                     // in; before the postamble, or last.
                     let Some(first) = ops.iter().position(|op| matches!(op, Op::Values(_))) else { return Ok(report) };
                     let Some(Op::Values(wants)) = ops.get(first) else { return Ok(report) };
-                    let fresh = fresh_datasets(&build_children(wants, warnings));
-                    let text = merge_all(&fresh, Within::Packet, ops.get(first + 1..).unwrap_or_default(), warnings).unwrap_or(fresh);
+                    let fresh = fresh_datasets(&build_children(wants, warnings, field_warnings));
+                    let text = merge_all(&fresh, Within::Packet, ops.get(first + 1..).unwrap_or_default(), warnings, field_warnings).unwrap_or(fresh);
                     if !readable(&text, Within::Packet, warnings) {
                         return Ok(report);
                     }
@@ -226,7 +278,7 @@ pub(super) fn rewrite(doc: &mut Document, ops: &[Op], reuse: Option<ObjRef>) -> 
         }
         Object::Stream(_) => {
             let Some((text, encoding)) = packet_text(doc, &xfa, warnings) else { return Ok(report) };
-            let Some(new) = merge_all(&text, Within::Xdp, ops, warnings) else { return Ok(report) };
+            let Some(new) = merge_all(&text, Within::Xdp, ops, warnings, field_warnings) else { return Ok(report) };
             if !readable(&new, Within::Xdp, warnings) {
                 return Ok(report);
             }

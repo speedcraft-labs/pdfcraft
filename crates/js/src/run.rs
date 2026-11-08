@@ -140,7 +140,7 @@ pub struct ScriptRunner {
 enum WorkerCommand {
     Run {
         script: String,
-        event: Event,
+        event: Box<Event>,
         doc: DocInfo,
         fields: Arc<Vec<FieldState>>,
         doc_scripts: Vec<String>,
@@ -167,10 +167,10 @@ impl ScriptRunner {
                     }
                 }
             });
-            return match worker {
+            match worker {
                 Ok(worker) => Self { sender: Some(sender), worker: Some(worker) },
                 Err(_) => Self { sender: None, worker: None },
-            };
+            }
         }
         #[cfg(target_arch = "wasm32")]
         Self {}
@@ -193,7 +193,7 @@ impl ScriptRunner {
             let (reply, result) = std::sync::mpsc::sync_channel(1);
             let command = WorkerCommand::Run {
                 script: script.to_owned(),
-                event: event.clone(),
+                event: Box::new(event.clone()),
                 doc: doc.clone(),
                 fields: Arc::clone(&fields),
                 doc_scripts: doc_scripts.to_vec(),
@@ -264,10 +264,10 @@ impl ScriptRunner {
                 error: Some("the calculation worker stopped with an internal error".into()),
                 ..Default::default()
             };
-            return match results.into_inner() {
+            match results.into_inner() {
                 Ok(results) => results.into_iter().zip(calls).map(|(outcome, (_, event))| outcome.unwrap_or_else(|| failed(event))).collect(),
                 Err(_) => calls.iter().map(|(_, event)| failed(event)).collect(),
-            };
+            }
         }
         #[cfg(target_arch = "wasm32")]
         calls.iter().map(|(script, event)| self.run_shared(script, event, doc, Arc::clone(&fields), doc_scripts, limits)).collect()
@@ -380,7 +380,7 @@ fn run_here(
     for (index, field) in fields.iter().enumerate() {
         field_index.entry(field.name.clone()).or_insert(index);
         for (offset, _) in field.name.match_indices('.') {
-            parent_index.entry(format!("{}", &field.name[..offset])).or_insert_with(|| field.name.clone());
+            parent_index.entry(field.name[..offset].to_string()).or_insert_with(|| field.name.clone());
         }
     }
     ctx.insert_data(RefCell::new(Host {
