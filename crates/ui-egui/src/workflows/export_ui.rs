@@ -5,12 +5,20 @@
 
 use std::sync::{Arc, Mutex};
 
+use craft_jobs::CancellationToken;
+#[cfg(not(target_arch = "wasm32"))]
+use craft_jobs::{JobSystem, Priority};
 use egui::{Align, Layout};
 use pdfcraft_engine::export::{ExportSource, Exporter, ImageFormat};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 
 use crate::marks_ui::PageRange;
 use crate::theme::{self, Tokens};
 use crate::{PdfCraftApp, widgets};
+
+#[cfg(not(target_arch = "wasm32"))]
+static EXPORT_JOBS: OnceLock<JobSystem> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportKind {
@@ -135,10 +143,13 @@ struct ExportTask<'a> {
     stem: String,
     status: &'a ExportStatus,
     lang: crate::i18n::Lang,
+    cancellation: Option<CancellationToken>,
 }
 
 fn run(task: ExportTask<'_>, mut sink: impl FnMut(&str, Vec<u8>) -> Result<(), String>) -> String {
-    let ExportTask { src, kind, dpi, format, min_side, pages, stem, status, lang } = task;
+    let ExportTask { src, kind, dpi, format, min_side, pages, stem, status, lang, cancellation } = task;
+    let cancelled = || cancellation.as_ref().is_some_and(CancellationToken::is_cancelled);
+    let cancellation_message = || crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", tl!("Cancelled"))]);
     // May run on a worker thread: messages are drawn in the UI's language.
     crate::i18n::set_current(lang);
     let total = pages.len();
@@ -148,12 +159,18 @@ fn run(task: ExportTask<'_>, mut sink: impl FnMut(&str, Vec<u8>) -> Result<(), S
         }
     };
     if kind == ExportKind::AllImages {
+        if cancelled() {
+            return cancellation_message();
+        }
         set(0, None);
         let out = match pdfcraft_engine::export::extract_images(&src, &pages, min_side) {
             Ok(o) => o,
             Err(e) => return crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", &e.to_string())]),
         };
         for (k, img) in out.images.iter().enumerate() {
+            if cancelled() {
+                return cancellation_message();
+            }
             if let Err(e) = sink(&pdfcraft_engine::export::image_file_name(&stem, img, k + 1, src.pages), img.data.clone()) {
                 return crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", &e.to_string())]);
             }
@@ -177,17 +194,26 @@ fn run(task: ExportTask<'_>, mut sink: impl FnMut(&str, Vec<u8>) -> Result<(), S
         // Handled above.
         ExportKind::AllImages => String::new(),
         ExportKind::Image => {
+            if cancelled() {
+                return cancellation_message();
+            }
             set(0, None);
             // Pages are drawn several at once and handed over in order: the progress counts the
             // pages written so far.
             let mut done = 0;
             let result = ex.images(&pages, dpi, format, |p, img| {
+                if cancelled() {
+                    return Err("cancelled".to_string());
+                }
                 sink(&format!("{stem}_page_{}.{}", p + 1, format.extension()), img)?;
                 done += 1;
                 set(done, None);
                 Ok(())
             });
             if let Err(e) = result {
+                if cancelled() {
+                    return cancellation_message();
+                }
                 return crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", &e.to_string())]);
             }
             let mut msg = if total == 1 {
@@ -207,6 +233,9 @@ fn run(task: ExportTask<'_>, mut sink: impl FnMut(&str, Vec<u8>) -> Result<(), S
             msg
         }
         ExportKind::Text => {
+            if cancelled() {
+                return cancellation_message();
+            }
             set(0, None);
             match ex.text_of(&pages).and_then(|text| sink(&format!("{stem}.txt"), text.into_bytes())) {
                 Ok(()) => {
@@ -245,13 +274,16 @@ impl PdfCraftApp {
         {
             let start = move |app: &mut Self, dir: std::path::PathBuf, inline: bool| {
                 let st = status.clone();
+                let failed = st.clone();
+                let total = pages.len();
                 let shown = dir.display().to_string();
                 let lang = crate::i18n::current();
-                let work = move || {
+                let job_key = format!("pdf-export-{id:?}");
+                let work = move |cancellation| {
                     let sink = |name: &str, bytes: Vec<u8>| {
                         crate::editing::write_atomically(&dir.join(name).to_string_lossy(), &bytes).map_err(|e| format!("{name}: {e}"))
                     };
-                    let msg = run(ExportTask { src, kind, dpi, format, min_side, pages, stem, status: &st, lang }, sink);
+                    let msg = run(ExportTask { src, kind, dpi, format, min_side, pages, stem, status: &st, lang, cancellation }, sink);
                     if let Ok(mut s) = st.lock() {
                         let (done, total) = s.as_ref().map_or((0, 0), |(d, t, _)| (*d, *t));
                         let done_msg = crate::i18n::fmt(tl!("{msg} to {dir}"), &[("msg", &msg), ("dir", &shown)]);
@@ -259,14 +291,27 @@ impl PdfCraftApp {
                     }
                 };
                 if inline {
-                    work(); // tests and automation: synchronous
+                    work(None); // tests and automation: synchronous
                 } else {
-                    std::thread::Builder::new().name("pdfcraft-export".into()).spawn(work).ok();
+                    let jobs = EXPORT_JOBS.get_or_init(|| JobSystem::new(2));
+                    if jobs.is_available() {
+                        let handle = jobs.submit_latest(job_key, Priority::Interactive, move |ctx| {
+                            work(Some(ctx.cancellation()));
+                            Ok(())
+                        });
+                        handle.detach();
+                    } else {
+                        if let Ok(mut s) = failed.lock() {
+                            let reason = "background worker is unavailable";
+                            let msg = crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", reason)]);
+                            *s = Some((0, total, Some(msg)));
+                        }
+                    }
                 }
                 app.export_status = Some(status);
             };
             match self.export_dir_override.clone() {
-                Some(d) => start(self, d.into(), true),
+                Some(d) => start(self, d.into(), self.run_inline || self.ctx.is_none()),
                 None => {
                     let dialog = rfd::AsyncFileDialog::new().set_title(tl!("Choose a folder for the exported files").to_string());
                     self.ask_one(crate::pickers::Ask::Folder(dialog), None, move |app, dir| start(app, dir, false));
@@ -275,10 +320,10 @@ impl PdfCraftApp {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let msg =
-                run(ExportTask { src, kind, dpi, format, min_side, pages, stem, status: &status, lang: crate::i18n::current() }, |name, bytes| {
-                    crate::editing::download(name, &bytes)
-                });
+            let msg = run(
+                ExportTask { src, kind, dpi, format, min_side, pages, stem, status: &status, lang: crate::i18n::current(), cancellation: None },
+                |name, bytes| crate::editing::download(name, &bytes),
+            );
             if let Ok(mut s) = status.lock() {
                 *s = Some((0, 0, Some(msg)));
             }

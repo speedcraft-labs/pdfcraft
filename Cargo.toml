@@ -12,6 +12,7 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/pdfcraft"
 
 [workspace.dependencies]
+craft-jobs = { git = "https://github.com/speedcraft-labs/craft-libs", version = "0.1.0", rev = "f1162559687ebdd91ba4a829483cb79e8bf490aa" }
 # Shared frontend components; engines remain independent of egui.
 craft-ui = { git = "https://github.com/storytold/craft-libs", version = "0.1.0", rev = "787a7a0f972fd1d7a7618fdbeca3a5267a0407ff", features = ["serde"] }
 # Quit the macOS way (#1136): ⌘Q asks about unsaved changes, and closing quits through `terminate:`.
