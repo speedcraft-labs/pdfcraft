@@ -7,7 +7,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
-use pdfcraft_engine::{AddedText, Edit, FieldValue, FormFieldKind, Session};
+use pdfcraft_engine::{AddedText, Edit, FieldValue, FormFieldKind, Session, export::Exporter};
 use sha2::{Digest, Sha256};
 
 const PAGE_COUNT: usize = 100_000;
@@ -66,6 +66,24 @@ fn pdf(pages: usize, fields: usize) -> Vec<u8> {
 
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn verify_saved_pdf(path: &str) -> Result<(), Box<dyn Error>> {
+    let bytes = Arc::new(std::fs::read(path)?);
+    let mut session = Session::new();
+    let id = session.open(path, Some(path.to_owned()), bytes, None)?;
+    let doc = session.get(id).ok_or("the saved PDF did not open")?;
+    let page_count = doc.info.pages.len();
+    let pages = (0..page_count).collect::<Vec<_>>();
+    let text = Exporter::new(doc).text_of(&pages)?;
+    let mut fields = doc.form.iter().map(|field| (field.name.clone(), field.value.clone())).collect::<Vec<_>>();
+    fields.sort();
+    let mut semantic = format!("pages={page_count}\n{text}\n");
+    for (name, values) in fields {
+        semantic.push_str(&format!("field:{name}:{values:?}\n"));
+    }
+    println!("CRAFT_OUTPUT_SHA256={}", digest(semantic.as_bytes()));
+    Ok(())
 }
 
 fn differential(path: &str) -> Result<(), Box<dyn Error>> {
@@ -187,9 +205,12 @@ mod tests {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    let journey = args.next().ok_or("usage: edit_bench pages|form|open-real|edit-real|form-real|save-real [FILE] [FIELD|OUTPUT]")?;
+    let journey = args.next().ok_or("usage: edit_bench pages|form|open-real|edit-real|form-real|save-real|verify-real [FILE] [FIELD|OUTPUT]")?;
     let file = args.next();
     let next = args.next();
+    if journey == "verify-real" {
+        return verify_saved_pdf(file.as_deref().ok_or("verify-real needs a saved PDF path")?);
+    }
     let (field_name, output_path) = if journey == "save-real" { (args.next(), next) } else { (next, None) };
     if journey == "differential" {
         return differential(file.as_deref().ok_or("usage: edit_bench differential FILE")?);
