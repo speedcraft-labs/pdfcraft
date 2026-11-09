@@ -758,6 +758,8 @@ Newest first: the date, what moved, and the new overall estimate.
 - M13: common command, batch, inspection and bounded preview tools share the existing confined automation path. MCP tools carry complete hints and reject unknown top-level keys as invalid parameters.
 - **2026-10-10 (UI docking):** Tools and Inspector can be regrouped, split beside the PDF, or floated inside the app window. Existing toggles reopen panels at their saved locations; UI commands arrange/reset panels, and preferences retain their layout. Read/full-screen modes preserve the focused document view. No milestone percentage change.
 
+- **2026-11-09 (issue #291):** Added a benchmark-only adapter for opening the public 12-page IRS Form 990, editing one field and saving the edited PDF. Paired upstream/fork timings are pending; no speed claim is made yet.
+
 ## Revision history
 
 **2026-10-25 · minor:** M14 localization current state: Arabic catalogs stay logical, Arabic/Kurdish labels take an explicit RTL direction, and stock chrome mirrors; native/browser RTL input, IME and complex workflows remain unqualified. Native Simplified Chinese uses LXGW WenKai Lite; the web build has no Hans face. Estimates unchanged.

@@ -187,9 +187,10 @@ mod tests {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    let journey = args.next().ok_or("usage: edit_bench pages|form [FILE] [FIELD]")?;
+    let journey = args.next().ok_or("usage: edit_bench pages|form|open-real|edit-real|form-real|save-real [FILE] [FIELD|OUTPUT]")?;
     let file = args.next();
-    let field_name = args.next();
+    let next = args.next();
+    let (field_name, output_path) = if journey == "save-real" { (args.next(), next) } else { (next, None) };
     if journey == "differential" {
         return differential(file.as_deref().ok_or("usage: edit_bench differential FILE")?);
     }
@@ -197,7 +198,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "pages" if file.is_none() => (PAGE_COUNT, 0),
         "form" if file.is_none() => (1, FIELD_COUNT),
         "pages" | "form" => return Err("synthetic journeys do not take a file".into()),
-        "pages-real" | "form-real" if file.is_some() => (0, 0),
+        "pages-real" | "form-real" | "open-real" | "edit-real" | "save-real" if file.is_some() => (0, 0),
         _ => return Err(format!("unknown journey {journey:?}").into()),
     };
     let input = match file {
@@ -205,8 +206,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => Arc::new(pdf(pages, fields)),
     };
     let mut session = Session::new().with_clock(fixed_clock);
+    let open_start = Instant::now();
     let id = session.open(file.as_deref().unwrap_or("synthetic-edit.pdf"), None, input, None)?;
-    let selected_field = if journey == "form-real" {
+    let open_ns = open_start.elapsed().as_nanos();
+    let selected_field = if journey == "form-real" || journey == "edit-real" || journey == "save-real" {
         let doc = session.get(id).ok_or("the document did not open")?;
         let field = field_name
             .as_deref()
@@ -216,7 +219,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     field.kind == FormFieldKind::Text
                         && !field.read_only()
                         && !field.widgets.is_empty()
-                        && (field.actions.calculate != pdfcraft_forms::af::Calculate::None
+                        && (journey == "edit-real"
+                            || field.actions.calculate != pdfcraft_forms::af::Calculate::None
                             || field.actions.format != pdfcraft_forms::af::Format::None
                             || field.actions.validate != pdfcraft_forms::af::Validate::None
                             || field.actions.scripts.calculate.is_some()
@@ -232,32 +236,59 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
     let mut samples = Vec::with_capacity(RUNS);
-    for run in 0..RUNS {
+    let mut output_digest = None;
+    if journey == "open-real" {
+        samples.push(open_ns);
+    } else if journey == "edit-real" {
+        let name = selected_field.as_ref().ok_or("PDF has no editable text field")?;
         let start = Instant::now();
-        if journey == "pages" || journey == "pages-real" {
-            session.apply(
-                id,
-                Edit::AddText {
-                    page: 0,
-                    text: AddedText { rect: [20.0, 250.0, 180.0, 280.0], text: format!("Edit {}", run % 2), ..Default::default() },
-                },
-            )?;
-        } else if let Some(name) = selected_field.as_ref() {
-            session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
-        } else {
-            session.apply(id, Edit::SetFieldValue { name: "field0000".into(), value: FieldValue::Text(format!("value{}", run % 2)) })?;
-        }
+        session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
         samples.push(start.elapsed().as_nanos());
+    } else if journey == "save-real" {
+        let name = selected_field.as_ref().ok_or("PDF has no editable text field")?;
+        session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
+        let output = output_path.as_deref().ok_or("save-real needs an output path")?;
+        let start = Instant::now();
+        let bytes = session.save_bytes(id)?;
+        std::fs::write(output, bytes.as_ref())?;
+        samples.push(start.elapsed().as_nanos());
+        output_digest = Some(digest(bytes.as_ref()));
+    } else {
+        for run in 0..RUNS {
+            let start = Instant::now();
+            if journey == "pages" || journey == "pages-real" {
+                session.apply(
+                    id,
+                    Edit::AddText {
+                        page: 0,
+                        text: AddedText { rect: [20.0, 250.0, 180.0, 280.0], text: format!("Edit {}", run % 2), ..Default::default() },
+                    },
+                )?;
+            } else if let Some(name) = selected_field.as_ref() {
+                session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
+            } else {
+                session.apply(id, Edit::SetFieldValue { name: "field0000".into(), value: FieldValue::Text(format!("value{}", run % 2)) })?;
+            }
+            samples.push(start.elapsed().as_nanos());
+        }
     }
     samples.sort_unstable();
     let doc = session.get(id).ok_or("the document disappeared")?;
-    println!("CRAFT_JOURNEY_NS={}", samples[RUNS / 2]);
-    println!("CRAFT_OUTPUT_SHA256={}", digest(doc.bytes.as_ref()));
+    let reported_ns = if journey == "open-real" || journey == "edit-real" || journey == "save-real" { samples[0] } else { samples[RUNS / 2] };
+    let output_identity = if journey == "edit-real" {
+        let name = selected_field.as_deref().ok_or("PDF has no editable text field")?;
+        let field = doc.form.iter().find(|field| field.name == name).ok_or("the edited PDF field disappeared")?;
+        digest(format!("{:?}", field.value).as_bytes())
+    } else {
+        output_digest.unwrap_or_else(|| digest(doc.bytes.as_ref()))
+    };
+    println!("CRAFT_JOURNEY_NS={reported_ns}");
+    println!("CRAFT_OUTPUT_SHA256={output_identity}");
     println!(
         "{journey}: {} pages, {} fields, {}, {} bytes",
         doc.info.pages.len(),
         doc.form.len(),
-        selected_field.as_deref().unwrap_or("synthetic"),
+        selected_field.as_deref().or_else(|| (journey == "open-real").then_some("open")).unwrap_or("synthetic"),
         doc.bytes.len()
     );
     Ok(())
