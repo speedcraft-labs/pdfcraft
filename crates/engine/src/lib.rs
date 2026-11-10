@@ -158,7 +158,7 @@ use test_hooks::{check_refresh_panic, panic_on_refresh, record_link_scan, record
 use xfa_form::{
     XFA_REMOVED_PREFIX, XFA_SCRIPTS_OFF, decode_data_file, image_content_type, is_xfa_data_file, note_warnings, strip_xfa, sync_xfa_state,
     undrawn_field_warnings, xfa_after_data_change, xfa_initial_dataset_dirty_fields, xfa_layout, xfa_redraw, xfa_sync_changed_datasets,
-    xfa_sync_datasets, xfa_values_from_datasets,
+    xfa_sync_datasets, xfa_values_from_datasets_with_template,
 };
 
 mod clock;
