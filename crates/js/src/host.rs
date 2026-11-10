@@ -1,23 +1,12 @@
 use super::model::{DocInfo, FieldState, FieldType, Request};
 use super::run::MAX_ARRAY_LENGTH;
 use super::{
-    Arc, BTreeSet, Context, FunctionObjectBuilder, JsArray, JsError, JsFunction, JsNativeError, JsObject, JsResult, JsString, JsValue, Message,
-    NativeFunction, RefCell, xfa,
+    Arc, BTreeSet, Context, FunctionObjectBuilder, JsArray, JsError, JsFunction, JsNativeError, JsResult, JsString, JsValue, Message, NativeFunction,
+    RefCell, xfa,
 };
 
 pub(crate) struct Host {
     pub(crate) fields: Arc<Vec<FieldState>>,
-    /// First field for each fully qualified name, matching the old ordered lookup.
-    pub(crate) field_index: std::collections::HashMap<String, usize>,
-    /// First child field for each qualified parent name, matching `getField(parent)`.
-    pub(crate) parent_index: std::collections::HashMap<String, String>,
-    /// Field actions in this run only inspect field names and values; use a small value view.
-    pub(crate) simple_fields: bool,
-    /// Within one isolated script run, compact `getField()` views are stable objects. Reusing
-    /// them avoids allocating thousands of wrappers in common whole-form calculations.
-    pub(crate) compact_field_objects: std::collections::HashMap<String, JsObject>,
-    /// Fields whose script-visible properties the current action read.
-    pub(crate) observed: BTreeSet<usize>,
     pub(crate) changed: BTreeSet<usize>,
     pub(crate) alerts: Vec<Message>,
     pub(crate) console: Vec<String>,
@@ -64,10 +53,10 @@ impl Host {
 
     /// Record `r`, its names and URLs cut to a message's length, up to [`xfa::MAX_EFFECTS`]
     /// requests and the run's byte budget.
-    pub(crate) fn request(&mut self, r: Request) {
+    pub(crate) fn request(&mut self, r: Request) -> bool {
         if self.requests.len() >= xfa::MAX_EFFECTS {
             self.dropped = self.dropped.saturating_add(1);
-            return;
+            return false;
         }
         let r = match r {
             Request::Reset(names) => Request::Reset(names.into_iter().map(xfa::clip).collect()),
@@ -79,11 +68,14 @@ impl Host {
         let bytes = match &r {
             Request::Reset(names) => names.iter().fold(0usize, |n, s| n.saturating_add(s.len()).saturating_add(std::mem::size_of::<String>())),
             Request::LaunchUrl(u) | Request::Submit(u) | Request::Focus(u) => u.len(),
+            Request::OpenAttachment { name, .. } => name.len(),
             _ => 0,
         };
-        if self.room(bytes) {
+        let kept = self.room(bytes);
+        if kept {
             self.requests.push(r);
         }
+        kept
     }
 }
 
@@ -173,14 +165,12 @@ pub(crate) fn colour(c: &Option<Vec<String>>, ctx: &mut Context) -> JsValue {
 
 fn field_index(ctx: &Context, name: &JsString) -> JsResult<usize> {
     let n = name.to_std_string_escaped();
-    host(ctx)?.borrow().field_index.get(&n).copied().ok_or_else(|| error(format!("no field named {n}")))
+    host(ctx)?.borrow().fields.iter().position(|f| f.name == n).ok_or_else(|| error(format!("no field named {n}")))
 }
 
 pub(crate) fn read(ctx: &Context, name: &JsString) -> JsResult<FieldState> {
     let i = field_index(ctx, name)?;
-    let mut h = host(ctx)?.borrow_mut();
-    h.observed.insert(i);
-    Ok(h.fields[i].clone())
+    Ok(host(ctx)?.borrow().fields[i].clone())
 }
 
 pub(crate) fn write(ctx: &Context, name: &JsString, change: impl FnOnce(&mut FieldState)) -> JsResult<()> {
@@ -192,29 +182,18 @@ pub(crate) fn write(ctx: &Context, name: &JsString, change: impl FnOnce(&mut Fie
     Ok(())
 }
 
-pub(crate) fn value_of_parts(kind: FieldType, values: &[String], ctx: &mut Context) -> JsValue {
-    match kind {
-        FieldType::CheckBox | FieldType::RadioButton => s(values.first().map_or("Off", String::as_str)),
-        FieldType::ListBox if values.len() > 1 => {
-            let vals: Vec<JsValue> = values.iter().map(|v| s(v)).collect();
+pub(crate) fn value_of(f: &FieldState, ctx: &mut Context) -> JsValue {
+    match f.kind {
+        FieldType::CheckBox | FieldType::RadioButton => s(f.value.first().map_or("Off", String::as_str)),
+        FieldType::ListBox if f.value.len() > 1 => {
+            let vals: Vec<JsValue> = f.value.iter().map(|v| s(v)).collect();
             JsArray::from_iter(vals, ctx).into()
         }
         _ => {
-            let v = values.first().cloned().unwrap_or_default();
+            let v = f.single();
             as_number(&v).map_or_else(|| s(&v), JsValue::from)
         }
     }
-}
-
-pub(crate) fn value(ctx: &mut Context, name: &JsString) -> JsResult<JsValue> {
-    let index = field_index(ctx, name)?;
-    let (kind, values) = {
-        let mut h = host(ctx)?.borrow_mut();
-        h.observed.insert(index);
-        let field = &h.fields[index];
-        (field.kind, field.value.clone())
-    };
-    Ok(value_of_parts(kind, &values, ctx))
 }
 
 pub(crate) fn set_value(f: &mut FieldState, vals: Vec<String>) {

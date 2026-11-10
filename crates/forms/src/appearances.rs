@@ -1,6 +1,6 @@
 use super::read::{acroform, fields};
 use super::values::merged_appearance;
-use super::{Dict, Document, Field, FieldKind, ObjRef, Object, Widget, appearance, name_bytes};
+use super::{Dict, Document, FieldKind, ObjRef, Object, Widget, appearance, name_bytes};
 
 /// Whether the form asks viewers to draw its fields' appearances themselves (`/NeedAppearances`).
 pub fn need_appearances(doc: &Document) -> bool {
@@ -10,12 +10,12 @@ pub fn need_appearances(doc: &Document) -> bool {
 /// A copy of `doc` in which form fields are drawn the way the file leaves to the viewer, for
 /// displaying the document (`None` when no widget needs it). Text and choice fields are drawn from
 /// their values: every one when the form sets `/NeedAppearances` (ISO 32000-2 Table 224: the
-/// writer left the appearances to the viewer), and otherwise each widget without a normal
-/// appearance (`/AP /N`), as typing the value would draw it (#3470). Check boxes and radio buttons
-/// with no normal appearance for their state (`/AS`) are drawn from their `/MK` background, border
-/// and caption, and with `/NeedAppearances` every one that has an `/MK` is, over its own
-/// appearance; push buttons with none are drawn from their `/MK` and `/BS` (Table 192). `doc` is
-/// not changed: saving writes the file as it was.
+/// writer left the appearances to the viewer), and otherwise each widget whose normal appearance
+/// (`/AP /N`) gives no stream to draw, as typing the value would draw it (#3470). Check boxes and
+/// radio buttons with no normal appearance stream for their state (`/AS`; an Off state may have
+/// none) are drawn from their `/MK` background, border and caption, and with `/NeedAppearances`
+/// every one that has an `/MK` is, over its own appearance; push buttons with none are drawn from
+/// their `/MK` and `/BS` (Table 192). `doc` is not changed: saving writes the file as it was.
 pub fn with_field_appearances(doc: &Document) -> Option<Document> {
     with_field_appearances_cached(doc, &mut FieldAppearanceCache::default())
 }
@@ -48,13 +48,14 @@ pub fn with_field_appearances_cached(doc: &Document, cache: &mut FieldAppearance
             // drawn from it (Table 192), its own appearance or not; one without /MK keeps its own.
             let described = || widget.as_dict().and_then(|d| d.get(b"MK")).is_some_and(|mk| doc.resolve(mk).as_dict().is_some());
             let missing = match f.kind {
-                FieldKind::Text | FieldKind::Combo | FieldKind::List => normal.is_none() || all,
-                FieldKind::PushButton => normal.is_none(),
+                FieldKind::Text | FieldKind::Combo | FieldKind::List => all || !shows_stream(doc, normal.as_deref(), w.state.as_deref()),
+                FieldKind::PushButton => !shows_stream(doc, normal.as_deref(), w.state.as_deref()),
                 FieldKind::CheckBox | FieldKind::Radio => match (normal.as_deref(), state.as_deref()) {
                     _ if all && described() => true,
-                    (None, _) => true,
-                    (Some(Object::Dict(states)), Some(s)) => s != "Off" && !states.contains(&name_bytes(s)),
-                    _ => false,
+                    (Some(Object::Stream(_)), _) => false,
+                    // An Off state may go without an appearance; an on state needs a stream.
+                    (Some(Object::Dict(_)), Some("Off")) => false,
+                    (n, s) => !shows_stream(doc, n, s),
                 },
                 FieldKind::Signature => false,
             };
@@ -75,6 +76,9 @@ pub fn with_field_appearances_cached(doc: &Document, cache: &mut FieldAppearance
                 }
             };
             let target = copy.get_or_insert_with(|| doc.clone());
+            let mut stream = stream;
+            // Thai glyphs are streams of their own.
+            pdfcraft_fonts::shaped_text::store_streams(target, &mut stream.dict);
             let ap = target.add(Object::Stream(stream));
             let mut fresh = Dict::new();
             match &state {
@@ -101,145 +105,15 @@ pub fn with_field_appearances_cached(doc: &Document, cache: &mut FieldAppearance
     copy
 }
 
-/// Copy one already-redrawn, root-level text field into a display document from the same PDF
-/// revision. This lets an editor retain every other display-only appearance instead of rebuilding
-/// them after one field value changes. Returns false when the appearance refers to an object that
-/// is new or edited in `source`; callers should then rebuild the display copy normally.
-pub fn update_simple_text_field_display(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
-    let [widget] = field.widgets.as_slice() else { return false };
-    if field.kind != FieldKind::Text || field.obj != widget.obj {
-        return false;
-    }
-    let source_field = source.get(field.obj);
-    let Some(source_dict) = source_field.as_dict() else { return false };
-    if source_dict.reference(b"Parent").is_some() {
-        return false;
-    }
-    let value = source_dict.get(b"V").cloned();
-    if value.as_ref().is_some_and(|value| has_edited_reference(source, value)) {
-        return false;
-    }
-    // The display revision is the snapshot that will receive this appearance. Drawing against
-    // it keeps its resource references valid even when the editable source has a newer /DR.
-    let stream = appearance::field_appearance_drawn(display, field, widget, &field.value, true).0;
-    if stream.dict.iter().any(|(_, value)| has_edited_reference(display, value)) {
-        return false;
-    }
-    cache.insert(widget.obj, appearance_inputs(source, widget), &stream);
-
-    let appearance = display.add(Object::Stream(stream));
-    let mut fresh = Dict::new();
-    fresh.set(b"N".to_vec(), Object::Ref(appearance));
-    let ap = merged_appearance(display, widget.obj, &fresh);
-    display
-        .update_dict(field.obj, |dict| {
-            if let Some(value) = value {
-                dict.set(b"V".to_vec(), value);
-            } else {
-                dict.remove(b"V");
-            }
-            dict.remove(b"RV");
-            dict.set(b"AP".to_vec(), Object::Dict(ap));
-        })
-        .is_ok()
-}
-
-/// Copy the new value and appearances of a changed terminal field into an existing display
-/// revision. This handles hierarchical fields, fields with several widgets, and button/choice
-/// fields. It refuses references to newly edited source objects, leaving the caller to rebuild
-/// the display copy so that action-created resources cannot be missed.
-pub fn update_field_display(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
-    update_field_display_impl(source, display, field, cache, false)
-}
-
-/// Update the display when it was cloned from the edited source revision. References to objects
-/// edited in that revision are valid in both graphs, so they can stay in the generated appearance.
-pub fn update_field_display_from_source_revision(source: &Document, display: &mut Document, field: &Field, cache: &mut FieldAppearanceCache) -> bool {
-    update_field_display_impl(source, display, field, cache, true)
-}
-
-fn update_field_display_impl(
-    source: &Document,
-    display: &mut Document,
-    field: &Field,
-    cache: &mut FieldAppearanceCache,
-    same_revision: bool,
-) -> bool {
-    if field.widgets.is_empty() {
-        return false;
-    }
-    let source_field = source.get(field.obj);
-    let Some(field_dict) = source_field.as_dict() else { return false };
-    let value_keys: [&[u8]; 3] = [b"V", b"I", b"RV"];
-    let values: Vec<(&[u8], Object)> = value_keys.iter().filter_map(|key| field_dict.get(key).cloned().map(|value| (*key, value))).collect();
-    if !same_revision && values.iter().any(|(_, value)| has_edited_reference(source, value)) {
-        return false;
-    }
-
-    let mut updates = Vec::with_capacity(field.widgets.len());
-    for widget in &field.widgets {
-        let state = match field.kind {
-            FieldKind::CheckBox | FieldKind::Radio => {
-                let mine = |value: &&String| widget.on_state.as_ref().map_or(field.kind == FieldKind::CheckBox, |on| on == *value);
-                let value = field.value.first().filter(|value| !value.is_empty() && value.as_str() != "Off").filter(mine);
-                Some(widget.state.clone().or_else(|| value.cloned()).unwrap_or_else(|| "Off".into()))
-            }
-            _ => None,
-        };
-        let stream = match field.kind {
-            FieldKind::CheckBox | FieldKind::Radio => appearance::button_state_shown(display, field, widget, state.as_deref() != Some("Off")),
-            _ => appearance::field_appearance_drawn(display, field, widget, &field.value, true).0,
-        };
-        if !same_revision && stream.dict.iter().any(|(_, value)| has_edited_reference(display, value)) {
-            return false;
-        }
-        cache.insert(widget.obj, appearance_inputs(source, widget), &stream);
-        let appearance = display.add(Object::Stream(stream));
-        let mut fresh = Dict::new();
-        if let Some(state) = state.as_deref() {
-            let mut states = Dict::new();
-            states.set(name_bytes(state), Object::Ref(appearance));
-            fresh.set(b"N".to_vec(), Object::Dict(states));
-        } else {
-            fresh.set(b"N".to_vec(), Object::Ref(appearance));
-        }
-        let ap = merged_appearance(display, widget.obj, &fresh);
-        updates.push((widget.obj, state, ap));
-    }
-
-    for (widget, state, ap) in updates {
-        if display
-            .update_dict(widget, |dict| {
-                dict.set(b"AP".to_vec(), Object::Dict(ap));
-                if let Some(state) = state {
-                    dict.set(b"AS".to_vec(), Object::Name(name_bytes(&state)));
-                }
-            })
-            .is_err()
-        {
-            return false;
-        }
-    }
-
-    display
-        .update_dict(field.obj, |dict| {
-            for key in value_keys {
-                if let Some((_, value)) = values.iter().find(|(candidate, _)| *candidate == key) {
-                    dict.set(key.to_vec(), value.clone());
-                } else {
-                    dict.remove(key);
-                }
-            }
-        })
-        .is_ok()
-}
-
-fn has_edited_reference(doc: &Document, object: &Object) -> bool {
-    match object {
-        Object::Ref(r) => doc.is_edited(r.num),
-        Object::Array(items) => items.iter().any(|item| has_edited_reference(doc, item)),
-        Object::Dict(dict) => dict.iter().any(|(_, item)| has_edited_reference(doc, item)),
-        Object::Stream(stream) => stream.dict.iter().any(|(_, item)| has_edited_reference(doc, item)),
+/// Whether a widget's normal appearance `normal` (`/AP /N`, resolved) gives a stream to draw: the
+/// entry itself when it is a stream, or the stream it names for the appearance state `state`
+/// (`/AS`) when it is a subdictionary of states (ISO 32000-2 12.5.5, Table 170), as the renderer
+/// picks it. Anything else (no entry, null, a subdictionary without `/AS` or without a stream for
+/// that state, a dictionary that only looks like a form XObject) draws nothing.
+fn shows_stream(doc: &Document, normal: Option<&Object>, state: Option<&str>) -> bool {
+    match (normal, state) {
+        (Some(Object::Stream(_)), _) => true,
+        (Some(Object::Dict(states)), Some(s)) => states.get(&name_bytes(s)).is_some_and(|a| matches!(doc.resolve(a).as_ref(), Object::Stream(_))),
         _ => false,
     }
 }

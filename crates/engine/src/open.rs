@@ -7,8 +7,9 @@ use pdfcraft_render::{DocInfo, OpenError, RenderConfig, RenderPool, inspect};
 
 use crate::history::{Editor, Keys, TextBlocksCache};
 use crate::{
-    AppearanceCache, DocId, Document, Session, TrustStore, XFA_SCRIPTS_OFF, XfaLayout, display_bytes, display_config, guard, info_fields, js,
-    note_warnings, recovered_render_password, render_threads, same_pages, signatures_of, xfa, xfa_layout, xfa_values_from_datasets_with_template,
+    AppearanceCache, DocId, Document, Session, StatusCaptions, TrustStore, XFA_SCRIPTS_OFF, XfaLayout, display_bytes, display_config, guard,
+    info_fields, js, note_warnings, print_preview_layers, recovered_render_password, render_threads, same_pages, signatures_of, xfa, xfa_layout,
+    xfa_values_from_datasets,
 };
 
 /// Immutable session state needed while a document is prepared away from its owning thread.
@@ -17,6 +18,8 @@ pub struct OpenContext {
     now: Option<i64>,
     js_off: bool,
     trust: Arc<TrustStore>,
+    highlight: bool,
+    captions: Arc<StatusCaptions>,
     xfa_time_scale: u32,
 }
 
@@ -37,6 +40,14 @@ struct DocumentOpenData<'a> {
 }
 
 impl OpenContext {
+    /// This context with Highlight fields `on`, which the document's scripts read as
+    /// `app.runtimeHighlight` while it opens. A new document opens with the remembered setting
+    /// while the session keeps the one of the document in front, which its scripts read.
+    pub fn with_highlight(mut self, on: bool) -> Self {
+        self.highlight = on;
+        self
+    }
+
     /// Prepare a document without mutating the session that supplied this context.
     pub fn prepare_open(
         &self,
@@ -54,7 +65,14 @@ impl OpenContext {
 impl Session {
     /// Snapshot the session state that affects open-time scripts, dates and signature trust.
     pub fn open_context(&self) -> OpenContext {
-        OpenContext { now: self.now(), js_off: self.js_off, trust: self.trust.clone(), xfa_time_scale: self.xfa_time_scale.unwrap_or(1) }
+        OpenContext {
+            now: self.now(),
+            js_off: self.js_off,
+            trust: self.trust.clone(),
+            highlight: self.field_highlight,
+            captions: self.captions.clone(),
+            xfa_time_scale: self.xfa_time_scale.unwrap_or(1),
+        }
     }
 
     /// Prepare a document without adding it to this session.
@@ -74,6 +92,14 @@ impl Session {
         let id = DocId(self.next_id);
         let mut document = prepared.document;
         document.id = id;
+        // Trust or the interface language may have changed while it was prepared on another
+        // thread.
+        if !Arc::ptr_eq(&document.trust, &self.trust) {
+            document.captions = self.captions.clone();
+            Self::revalidate(&mut document, self.trust.clone());
+        } else if *document.captions != *self.captions {
+            Self::draw_captions(&mut document, self.captions.clone());
+        }
         self.docs.push(document);
         id
     }
@@ -84,6 +110,8 @@ impl Session {
         Ok(self.commit_open(prepared))
     }
 
+    /// What [`OpenContext::prepare_open`] runs inside its panic guard: read, decrypt and lay out
+    /// the document, and run an XFA form's opening scripts.
     fn prepare_open_unguarded(
         context: &OpenContext,
         name: String,
@@ -110,25 +138,31 @@ impl Session {
         // pages and fields so the rest of the engine works on it. The original bytes stay: the
         // laid-out form is one appended revision.
         let opts = SaveOptions { mod_date: context.now.map(pdfcraft_cos::pdf_date), ..SaveOptions::default() };
-        // Write `work` as one more revision and reopen it: what the document then is.
+        // Write `work` as one more revision and reopen it: what the document then is. The notes
+        // about damage repaired while reading the file stay with it (Document Properties), once.
         let rebase = |work: &pdfcraft_cos::Document| -> Result<(Arc<Vec<u8>>, DocInfo, pdfcraft_cos::Document), String> {
             let new_bytes = write_incremental(work, &opts).map(Arc::new).map_err(|e| e.to_string())?;
             let new_info = inspect(new_bytes.clone(), render_password.as_deref()).map_err(|e| e.to_string())?;
-            let new_cos = pdfcraft_cos::Document::open_with_password(new_bytes.clone(), password).map_err(|e| e.to_string())?;
+            let mut new_cos = pdfcraft_cos::Document::open_with_password(new_bytes.clone(), password).map_err(|e| e.to_string())?;
+            for line in work.repair_log() {
+                if !new_cos.repair_log().contains(line) {
+                    new_cos.note_repair(line.clone());
+                }
+            }
             Ok((new_bytes, new_info, new_cos))
         };
-        let (bytes, info, cos, xfa, parsed_xfa_data_template) = match (info.xfa, cos) {
+        let (bytes, info, cos, xfa) = match (info.xfa, cos) {
             (Some(pdfcraft_render::Xfa::Dynamic), Ok(Ok(cos))) if pdfcraft_xfa::existing_layout(&cos).is_none() => {
                 let mut work = cos.clone();
                 let laid_out = guard(|| xfa_layout(&mut work))
                     .unwrap_or_else(|m| Err(format!("laying it out failed unexpectedly ({m})")))
                     .and_then(|report| rebase(&work).map(|(b, i, c)| (b, i, c, report)));
                 match laid_out {
-                    Ok((b, i, c, report)) => (b, i, Ok(Ok(c)), Some(report), None),
+                    Ok((b, i, c, report)) => (b, i, Ok(Ok(c)), Some(report)),
                     Err(e) => {
                         let mut info = info;
                         info.warnings.push(format!("This dynamic XFA form could not be laid out: {e}"));
-                        (bytes, info, Ok(Ok(cos)), None, None)
+                        (bytes, info, Ok(Ok(cos)), None)
                     }
                 }
             }
@@ -136,14 +170,11 @@ impl Session {
             // filled in by another viewer since; give the fields those values.
             (Some(_), Ok(Ok(cos))) => {
                 let report = pdfcraft_xfa::existing_layout(&cos);
-                // Dataset-value synchronization also needs the template. Reuse this parsed
-                // instance below instead of parsing the same XFA packet a second time.
-                let xfa_data_template = xfa::data_template(&cos);
                 let mut work = cos.clone();
-                let synced = guard(|| xfa_values_from_datasets_with_template(&mut work, xfa_data_template.as_deref()))
-                    .unwrap_or_else(|m| Err(format!("reading its data failed unexpectedly ({m})")));
+                let synced =
+                    guard(|| xfa_values_from_datasets(&mut work)).unwrap_or_else(|m| Err(format!("reading its data failed unexpectedly ({m})")));
                 match synced {
-                    Ok(names) if names.is_empty() => (bytes, info, Ok(Ok(cos)), report, Some(xfa_data_template)),
+                    Ok(names) if names.is_empty() => (bytes, info, Ok(Ok(cos)), report),
                     Ok(names) => match rebase(&work) {
                         Ok((b, mut i, c)) => {
                             // The fields were rewritten from the XFA data: say so, and which.
@@ -155,32 +186,31 @@ impl Session {
                                 if names.len() == 1 { "" } else { "s" },
                                 shown.join(", ")
                             ));
-                            (b, i, Ok(Ok(c)), report, Some(xfa_data_template))
+                            (b, i, Ok(Ok(c)), report)
                         }
                         Err(e) => {
                             let mut info = info;
                             info.warnings.push(format!("The values in this form's XFA data could not be applied: {e}"));
-                            (bytes, info, Ok(Ok(cos)), report, Some(xfa_data_template))
+                            (bytes, info, Ok(Ok(cos)), report)
                         }
                     },
                     Err(e) => {
                         let mut info = info;
                         info.warnings.push(format!("The values in this form's XFA data could not be applied: {e}"));
-                        (bytes, info, Ok(Ok(cos)), report, Some(xfa_data_template))
+                        (bytes, info, Ok(Ok(cos)), report)
                     }
                 }
             }
-            (_, cos) => (bytes, info, cos, None, None),
+            (_, cos) => (bytes, info, cos, None),
         };
         // A laid-out XFA form: its initialize and calculate scripts run now, as on opening in
         // Acrobat; what they change is one more revision, still nothing to save.
         let mut script_output = js::JsOutput::default();
         let mut ran_away = false;
-        let xfa_data_template = parsed_xfa_data_template.unwrap_or_else(|| match (info.xfa.as_ref(), &cos) {
-            (Some(_), Ok(Ok(c))) => xfa::data_template(c),
+        let xfa_template = match (&xfa, &cos) {
+            (Some(_), Ok(Ok(c))) => xfa::template(c),
             _ => None,
-        });
-        let xfa_template = xfa_data_template.clone().filter(|template| pdfcraft_xfa::has_scripts(template));
+        };
         let (bytes, info, cos) = match (&xfa, cos) {
             (Some(_), Ok(Ok(cos))) if !context.js_off => match xfa_template.clone() {
                 Some(tpl) => {
@@ -191,9 +221,8 @@ impl Session {
                             page_count: pages,
                             out: &mut script_output,
                             datasets: None,
-                            changed_fields: Default::default(),
-                            structure_changed: false,
                             ran_away: false,
+                            highlight: context.highlight,
                             time_scale: context.xfa_time_scale,
                         };
                         let changes = xfa::on_open(&mut work, &tpl, &mut run);
@@ -245,9 +274,6 @@ impl Session {
                 };
                 match rebuilt {
                     Some((b, i, mut c)) => {
-                        for line in cos.repair_log() {
-                            c.note_repair(line.clone());
-                        }
                         c.note_repair(format!("the page tree is missing; its {} pages were found by scanning the file", i.pages.len()));
                         (b, i, Ok(Ok(c)))
                     }
@@ -259,16 +285,9 @@ impl Session {
         // XFA notes survive the document being re-read after edits.
         let xfa_warnings: Vec<String> = if info.xfa.is_some() { info.warnings.clone() } else { Vec::new() };
         let mut document =
-            Self::build_document(&context.trust, DocumentOpenData { name, path, bytes, info, structure: cos, render_password, password, xfa });
+            Self::build_document(context, DocumentOpenData { name, path, bytes, info, structure: cos, render_password, password, xfa });
         // A script that ran away on open turns the form's scripts off for this document.
         document.xfa_template = if ran_away { None } else { xfa_template };
-        document.xfa_data_template = xfa_data_template;
-        if document.info.xfa.is_some() {
-            document.xfa_edit_plan = document
-                .editor
-                .as_ref()
-                .and_then(|editor| document.xfa_template.as_deref().map(|template| xfa::xfa_edit_plan(&editor.cos, template)));
-        }
         document.js_output.append(script_output);
         if ran_away {
             document.xfa_scripts_off = true;
@@ -279,9 +298,9 @@ impl Session {
     }
 
     /// The last step of opening: build the document record and register it.
-    fn build_document(trust: &Arc<TrustStore>, data: DocumentOpenData<'_>) -> Document {
+    fn build_document(context: &OpenContext, data: DocumentOpenData<'_>) -> Document {
         let DocumentOpenData { name, path, bytes, mut info, structure: cos, render_password, password, xfa } = data;
-        let config = RenderConfig { password: render_password.as_deref().map(Arc::from), ..Default::default() };
+        let mut config = RenderConfig { password: render_password.as_deref().map(Arc::from), ..Default::default() };
         let (mut editor, read_only_reason) = match cos {
             Ok(Ok(cos)) => {
                 let keys = Keys { render: render_password.clone(), reopen: password.map(str::to_owned) };
@@ -289,7 +308,6 @@ impl Session {
                 (
                     Some(Editor {
                         cos,
-                        calculation_cache: crate::js::CalculationCache::default(),
                         saved,
                         saved_keys: keys.clone(),
                         unsaved_file: false,
@@ -307,7 +325,7 @@ impl Session {
             Err(_) => (None, Some("the document structure could not be read for editing".into())),
         };
         let sig_cache = Arc::new(pdfcraft_sign::DigestCache::default());
-        let signatures = editor.as_ref().map(|e| signatures_of(&e.cos, &bytes, trust, &sig_cache)).unwrap_or_default();
+        let mut signatures = editor.as_ref().map(|e| signatures_of(&e.cos, &bytes, &context.trust, &sig_cache)).unwrap_or_default();
         // The inspection reads only `/Info`; a file stating its title or author only in XMP still
         // shows them (#2373).
         if let Some(e) = &editor {
@@ -317,7 +335,9 @@ impl Session {
                 }
             }
         }
-        let display = display_bytes(editor.as_mut(), &bytes);
+        // The print preview draws the layers as they print.
+        config.print_layers = print_preview_layers(editor.as_ref().map(|e| &e.cos), &info.layers);
+        let display = display_bytes(editor.as_mut(), &bytes, &mut signatures, &context.captions);
         let renderer = RenderPool::new(display.clone(), render_threads(), display_config(&config));
         let (form, adopted) = editor
             .as_ref()
@@ -338,9 +358,6 @@ impl Session {
             };
             e.cos.note_repair(line);
         }
-        if let Some(e) = editor.as_mut() {
-            e.calculation_cache = js::precompute_calculation_cache(&e.cos, &name);
-        }
         Document {
             id: DocId(0),
             name,
@@ -358,19 +375,16 @@ impl Session {
             marker_scan: OnceLock::new(),
             links: OnceLock::new(),
             signatures: Arc::new(signatures),
-            trust: trust.clone(),
+            trust: context.trust.clone(),
+            captions: context.captions.clone(),
             sig_cache,
             editor,
             config,
             js_output: Default::default(),
             xfa,
             xfa_template: None,
-            xfa_data_template: None,
-            xfa_initial_dataset_dirty: Default::default(),
-            xfa_initial_dataset_dirty_computed: false,
-            xfa_dataset_warnings: None,
-            xfa_edit_plan: None,
             xfa_scripts_off: false,
+            xfa_exited: Default::default(),
             fonts_stale: false,
             xfa_warnings: Vec::new(),
             edit_notices: Vec::new(),
