@@ -213,7 +213,7 @@ impl JsRunner {
         Self::with_document_scripts(cos, file_name, xfa, doc_scripts)
     }
 
-    fn with_document_scripts(cos: &pdfcraft_cos::Document, file_name: &str, xfa: bool, doc_scripts: Vec<(String, String)>) -> JsRunner {
+    fn with_document_scripts(cos: &pdfcraft_cos::Document, file_name: &str, xfa: bool, doc_scripts: Vec<String>) -> JsRunner {
         let doc =
             pdfcraft_js::DocInfo { file_name: file_name.to_string(), num_pages: pdfcraft_model::pages(cos).len(), page: 0, info: info(cos), xfa };
         JsRunner {
@@ -411,7 +411,7 @@ pub(crate) fn precompute_calculation_cache(cos: &pdfcraft_cos::Document, file_na
     if pdfcraft_xfa::existing_layout(cos).is_some() {
         return CalculationCache::default();
     }
-    let doc_scripts = document_scripts(cos);
+    let doc_scripts = pdfcraft_forms::document_scripts(cos);
     if !doc_scripts.is_empty() {
         return CalculationCache::default();
     }
