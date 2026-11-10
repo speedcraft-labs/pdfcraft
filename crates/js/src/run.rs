@@ -109,193 +109,6 @@ pub fn run(script: &str, event: &Event, doc: &DocInfo, fields: &[FieldState], do
 /// script can observe uncommitted writes. Read-only calculations avoid copying the whole form.
 pub fn run_shared(script: &str, event: &Event, doc: &DocInfo, fields: Arc<Vec<FieldState>>, doc_scripts: &[String], limits: Limits) -> Outcome {
     let failed = |why: String| Outcome { rc: true, value: event.value.clone(), change: event.change.clone(), error: Some(why), ..Default::default() };
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::thread::scope(|scope| {
-            let spawned = std::thread::Builder::new()
-                .name("pdfcraft-js".into())
-                .stack_size(SCRIPT_STACK)
-                .spawn_scoped(scope, || run_inline(script, event, doc, fields, doc_scripts, limits));
-            match spawned {
-                Ok(thread) => thread.join().unwrap_or_else(|_| failed("the script stopped with an internal error".into())),
-                Err(e) => failed(format!("the script engine could not start: {e}")),
-            }
-        })
-    }
-    #[cfg(target_arch = "wasm32")]
-    run_inline(script, event, doc, fields, doc_scripts, limits)
-}
-
-/// Reuses one large-stack worker across the several independent JavaScript actions in a single
-/// form edit. Each call still creates a fresh Boa context and field snapshot, as [`run_shared`]
-/// does; only the native thread and its stack are reused.
-pub struct ScriptRunner {
-    #[cfg(not(target_arch = "wasm32"))]
-    sender: Option<std::sync::mpsc::SyncSender<WorkerCommand>>,
-    #[cfg(not(target_arch = "wasm32"))]
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-enum WorkerCommand {
-    Run {
-        script: String,
-        event: Box<Event>,
-        doc: DocInfo,
-        fields: Arc<Vec<FieldState>>,
-        doc_scripts: Vec<String>,
-        limits: Limits,
-        reply: std::sync::mpsc::SyncSender<Outcome>,
-    },
-    Shutdown,
-}
-
-impl ScriptRunner {
-    /// Starts a worker with the same stack allowance as [`run_shared`]. If the OS cannot start
-    /// it, later calls use the ordinary one-shot runner and preserve its error handling.
-    pub fn new() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<WorkerCommand>(1);
-            let worker = std::thread::Builder::new().name("pdfcraft-js".into()).stack_size(SCRIPT_STACK).spawn(move || {
-                while let Ok(command) = receiver.recv() {
-                    match command {
-                        WorkerCommand::Run { script, event, doc, fields, doc_scripts, limits, reply } => {
-                            let _ = reply.send(run_inline(&script, &event, &doc, fields, &doc_scripts, limits));
-                        }
-                        WorkerCommand::Shutdown => break,
-                    }
-                }
-            });
-            match worker {
-                Ok(worker) => Self { sender: Some(sender), worker: Some(worker) },
-                Err(_) => Self { sender: None, worker: None },
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        Self {}
-    }
-
-    /// Run a script with a fresh context on this runner's reusable native worker.
-    pub fn run_shared(
-        &self,
-        script: &str,
-        event: &Event,
-        doc: &DocInfo,
-        fields: Arc<Vec<FieldState>>,
-        doc_scripts: &[String],
-        limits: Limits,
-    ) -> Outcome {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(sender) = &self.sender {
-            let failed =
-                |why: String| Outcome { rc: true, value: event.value.clone(), change: event.change.clone(), error: Some(why), ..Default::default() };
-            let (reply, result) = std::sync::mpsc::sync_channel(1);
-            let command = WorkerCommand::Run {
-                script: script.to_owned(),
-                event: Box::new(event.clone()),
-                doc: doc.clone(),
-                fields: Arc::clone(&fields),
-                doc_scripts: doc_scripts.to_vec(),
-                limits,
-                reply,
-            };
-            if sender.send(command).is_err() {
-                return failed("the script engine worker stopped unexpectedly".into());
-            }
-            return result.recv().unwrap_or_else(|_| failed("the script engine worker stopped unexpectedly".into()));
-        }
-        run_shared(script, event, doc, fields, doc_scripts, limits)
-    }
-
-    /// Run independent field calculations across a few large-stack workers. The caller proves
-    /// that their field reads are independent and that each script only writes its own event.
-    pub fn run_shared_batch(
-        &self,
-        calls: &[(String, Event)],
-        doc: &DocInfo,
-        fields: Arc<Vec<FieldState>>,
-        doc_scripts: &[String],
-        limits: Limits,
-    ) -> Vec<Outcome> {
-        if calls.len() < 2 {
-            return calls.iter().map(|(script, event)| self.run_shared(script, event, doc, Arc::clone(&fields), doc_scripts, limits)).collect();
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let available = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get).min(4);
-            let worker_count = available.min(calls.len());
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let results = std::sync::Mutex::new(vec![None; calls.len()]);
-            let spawned = std::thread::scope(|scope| {
-                let mut threads = Vec::with_capacity(worker_count);
-                for _ in 0..worker_count {
-                    let thread = std::thread::Builder::new().name("pdfcraft-js-calc".into()).stack_size(SCRIPT_STACK).spawn_scoped(scope, || {
-                        loop {
-                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some((script, event)) = calls.get(index) else { break };
-                            let outcome = run_inline(script, event, doc, Arc::clone(&fields), doc_scripts, limits);
-                            if let Ok(mut results) = results.lock() {
-                                results[index] = Some(outcome);
-                            } else {
-                                break;
-                            }
-                        }
-                    });
-                    if let Ok(thread) = thread {
-                        threads.push(thread);
-                    }
-                }
-                if threads.is_empty() {
-                    return false;
-                }
-                for thread in threads {
-                    let _ = thread.join();
-                }
-                true
-            });
-            if !spawned {
-                return calls.iter().map(|(script, event)| self.run_shared(script, event, doc, Arc::clone(&fields), doc_scripts, limits)).collect();
-            }
-            let failed = |event: &Event| Outcome {
-                rc: true,
-                value: event.value.clone(),
-                change: event.change.clone(),
-                error: Some("the calculation worker stopped with an internal error".into()),
-                ..Default::default()
-            };
-            match results.into_inner() {
-                Ok(results) => results.into_iter().zip(calls).map(|(outcome, (_, event))| outcome.unwrap_or_else(|| failed(event))).collect(),
-                Err(_) => calls.iter().map(|(_, event)| failed(event)).collect(),
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        calls.iter().map(|(script, event)| self.run_shared(script, event, doc, Arc::clone(&fields), doc_scripts, limits)).collect()
-    }
-}
-
-impl Default for ScriptRunner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for ScriptRunner {
-    fn drop(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(sender) = self.sender.take() {
-                let _ = sender.send(WorkerCommand::Shutdown);
-            }
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
-        }
-    }
-}
-
-fn run_inline(script: &str, event: &Event, doc: &DocInfo, fields: Arc<Vec<FieldState>>, doc_scripts: &[String], limits: Limits) -> Outcome {
-    let failed = |why: String| Outcome { rc: true, value: event.value.clone(), change: event.change.clone(), error: Some(why), ..Default::default() };
     if let Some(why) = refuse(script) {
         return failed(why);
     }
@@ -313,7 +126,24 @@ fn run_inline(script: &str, event: &Event, doc: &DocInfo, fields: Arc<Vec<FieldS
             None => Some((i, d.as_str())),
         })
         .collect();
-    run_here(script, event, doc, fields, &kept, &skipped, limits)
+    let (kept, skipped) = (&kept, &skipped);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // The script's thread writes dates as this one asked (`with_english_printd`).
+        let english = crate::format::printd_english();
+        std::thread::scope(|scope| {
+            let spawned = std::thread::Builder::new()
+                .name("pdfcraft-js".into())
+                .stack_size(SCRIPT_STACK)
+                .spawn_scoped(scope, || crate::format::with_english_printd(english, || run_here(script, event, doc, fields, kept, skipped, limits)));
+            match spawned {
+                Ok(thread) => thread.join().unwrap_or_else(|_| failed("the script stopped with an internal error".into())),
+                Err(e) => failed(format!("the script engine could not start: {e}")),
+            }
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    run_here(script, event, doc, fields, kept, skipped, limits)
 }
 
 /// Host hooks that refuse to compile code from strings (`eval`, `Function` and its generator
@@ -364,8 +194,6 @@ fn run_here(
     skipped: &[(usize, String)],
     limits: Limits,
 ) -> Outcome {
-    let simple_fields =
-        super::document::compact_field_shape(script) && doc_scripts.iter().all(|(_, source)| super::document::compact_field_shape(source));
     let mut ctx = match Context::builder().host_hooks(std::rc::Rc::new(NoCodeFromStrings)).build() {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -375,21 +203,8 @@ fn run_here(
     };
     ctx.runtime_limits_mut().set_loop_iteration_limit(limits.loop_iterations);
     ctx.runtime_limits_mut().set_recursion_limit(limits.recursion);
-    let mut field_index = std::collections::HashMap::with_capacity(fields.len());
-    let mut parent_index = std::collections::HashMap::new();
-    for (index, field) in fields.iter().enumerate() {
-        field_index.entry(field.name.clone()).or_insert(index);
-        for (offset, _) in field.name.match_indices('.') {
-            parent_index.entry(field.name[..offset].to_string()).or_insert_with(|| field.name.clone());
-        }
-    }
     ctx.insert_data(RefCell::new(Host {
         fields,
-        field_index,
-        parent_index,
-        simple_fields,
-        compact_field_objects: std::collections::HashMap::new(),
-        observed: BTreeSet::new(),
         changed: BTreeSet::new(),
         alerts: Vec::new(),
         console: Vec::new(),
@@ -398,12 +213,11 @@ fn run_here(
         kept: 0,
         dropped: 0,
     }));
-    super::document::init_field_accessors(&mut ctx);
     let mut out = Outcome { rc: true, value: event.value.clone(), change: event.change.clone(), ..Default::default() };
     let mut doc_errors: Vec<(usize, String)> = skipped.iter().map(|(i, why)| (*i, doc_error(*i, why))).collect();
     let result = (|| -> JsResult<()> {
         install(&mut ctx)?;
-        let ev = event_object(&mut ctx, event);
+        let (ev, value_store) = event_object(&mut ctx, event)?;
         ctx.register_global_property(js_string!("event"), ev.clone(), Attribute::all())?;
         // One document script that throws (calling a method PdfCraft lacks, say) must not keep
         // every field script in the form from running: what it defined before the error, and
@@ -421,6 +235,7 @@ fn run_here(
         out.rc = rc.to_boolean();
         let v = ev.get(js_string!("value"), &mut ctx)?;
         out.value = text(&v, &mut ctx)?;
+        out.value_set = value_store.get(js_string!("set"), &mut ctx)?.to_boolean();
         let c = ev.get(js_string!("change"), &mut ctx)?;
         out.change = text(&c, &mut ctx)?;
         Ok(())
@@ -432,7 +247,6 @@ fn run_here(
     out.doc_errors = doc_errors.into_iter().map(|(_, e)| e).collect();
     if let Some(h) = ctx.remove_data::<Shared>() {
         let h = h.into_inner();
-        out.observed = h.observed.into_iter().collect();
         out.changed = h.changed.iter().map(|i| h.fields[*i].clone()).collect();
         out.alerts = h.alerts;
         out.console = h.console;

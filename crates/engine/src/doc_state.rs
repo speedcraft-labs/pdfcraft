@@ -26,6 +26,9 @@ pub enum ImageEdit {
     Arrange(ArrangeOrder),
     /// Remove any private crop on the image.
     RemoveCrop,
+    /// Grouped Form artwork: draw its content in place, so its text and pictures can be edited
+    /// one by one (#2964).
+    Ungroup,
 }
 
 /// Forms ▸ Merge data files into spreadsheet: the field values of each file (FDF, XFDF or a
@@ -111,17 +114,6 @@ pub(crate) fn signatures_of(
     cache: &pdfcraft_sign::DigestCache,
 ) -> Vec<SignatureInfo> {
     pdfcraft_sign::pdf::list_cached(cos, bytes, trust, cache)
-}
-
-/// Revalidate signatures after a content-only edit, keeping their unchanged page/widget locations.
-pub(crate) fn signatures_after_content_edit(
-    cos: &pdfcraft_cos::Document,
-    bytes: &[u8],
-    trust: &TrustStore,
-    cache: &pdfcraft_sign::pdf::DigestCache,
-    previous: &[SignatureInfo],
-) -> Vec<SignatureInfo> {
-    pdfcraft_sign::pdf::list_cached_after_content_edit(cos, bytes, trust, cache, previous)
 }
 
 /// What Optimize PDF did.

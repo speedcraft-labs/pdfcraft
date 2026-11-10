@@ -86,123 +86,6 @@ fn verify_saved_pdf(path: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn differential(path: &str) -> Result<(), Box<dyn Error>> {
-    use pdfcraft_forms::{Field, FieldKind};
-
-    fn editable(field: &Field) -> bool {
-        if field.read_only() || field.widgets.is_empty() {
-            return false;
-        }
-        match field.kind {
-            FieldKind::Text | FieldKind::CheckBox => true,
-            FieldKind::Radio => field.widgets.iter().any(|widget| widget.on_state.is_some()),
-            FieldKind::Combo => field.has(pdfcraft_forms::flags::EDIT) || !field.options.is_empty(),
-            FieldKind::List => !field.options.is_empty(),
-            FieldKind::PushButton | FieldKind::Signature => false,
-        }
-    }
-
-    fn value(field: &Field) -> Option<FieldValue> {
-        if field.widgets.is_empty() {
-            return None;
-        }
-        match field.kind {
-            FieldKind::Text => Some(FieldValue::Text(if field.value.first().is_some_and(|value| value == "1") { "2" } else { "1" }.into())),
-            FieldKind::CheckBox => Some(FieldValue::Check(field.value.is_empty())),
-            FieldKind::Radio => field
-                .widgets
-                .iter()
-                .filter_map(|widget| widget.on_state.clone())
-                .find(|state| field.value.first() != Some(state))
-                .or_else(|| field.widgets.iter().find_map(|widget| widget.on_state.clone()))
-                .map(|state| FieldValue::Radio(Some(state))),
-            FieldKind::Combo if field.has(pdfcraft_forms::flags::EDIT) && field.options.is_empty() => {
-                Some(FieldValue::Choice(vec!["differential-value".into()]))
-            }
-            FieldKind::Combo | FieldKind::List => field
-                .options
-                .iter()
-                .find(|(export, _)| field.value.first() != Some(export))
-                .or_else(|| field.options.first())
-                .map(|(export, _)| FieldValue::Choice(vec![export.clone()])),
-            FieldKind::PushButton | FieldKind::Signature => None,
-        }
-    }
-
-    let bytes = Arc::new(std::fs::read(path)?);
-    let mut fast = Session::new().with_clock(fixed_clock);
-    let fast_id = fast.open(path, None, Arc::clone(&bytes), None)?;
-    let mut slow = Session::new().with_clock(fixed_clock);
-    let slow_id = slow.open(path, None, bytes, None)?;
-    let all = fast.get(fast_id).ok_or("the fast document did not open")?.form.to_vec();
-    let shard_count = std::env::var("PDFCRAFT_DIFF_SHARDS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
-    let shard = std::env::var("PDFCRAFT_DIFF_SHARD").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
-    let field_filter = std::env::var("PDFCRAFT_DIFF_FIELD").ok();
-    if shard_count == 0 || shard >= shard_count {
-        return Err(format!("invalid differential shard {shard} of {shard_count}").into());
-    }
-    let mut compared = 0usize;
-    let mut actionful = 0usize;
-    let mut editable_fields = 0usize;
-    let mut seen = std::collections::HashSet::new();
-    for field in &all {
-        if !editable(field) || !seen.insert(field.name.clone()) {
-            continue;
-        }
-        let field_shard = editable_fields % shard_count;
-        editable_fields += 1;
-        if field_shard != shard || field_filter.as_deref().is_some_and(|name| field.name != name) {
-            continue;
-        }
-        let Some(next) = value(field) else { return Err(format!("editable field {:?} has no differential value", field.name).into()) };
-        if !field.actions.is_empty() || !field.actions.unsupported.is_empty() {
-            actionful += 1;
-        }
-        let edit = Edit::SetFieldValue { name: field.name.clone(), value: next };
-        let fast_result = fast.apply(fast_id, edit.clone());
-        let slow_result = slow.apply_without_form_fast_path(slow_id, edit);
-        if format!("{fast_result:?}") != format!("{slow_result:?}") {
-            return Err(
-                format!("fast and general Session edits return different results for {:?}: {fast_result:?} vs {slow_result:?}", field.name).into()
-            );
-        }
-        let fast_doc = fast.get(fast_id).ok_or("the fast document disappeared")?;
-        let slow_doc = slow.get(slow_id).ok_or("the general document disappeared")?;
-        let fast_bytes = fast_doc.bytes.as_ref();
-        let slow_bytes = slow_doc.bytes.as_ref();
-        if fast_bytes != slow_bytes {
-            return Err(format!("fast and general setters differ for {:?}", field.name).into());
-        }
-        if format!("{:?}", fast_doc.info.fields) != format!("{:?}", slow_doc.info.fields) {
-            return Err(format!("fast and general cached field values differ for {:?}", field.name).into());
-        }
-        let fast_output = fast.take_js_output(fast_id);
-        let slow_output = slow.take_js_output(slow_id);
-        if fast_output != slow_output {
-            return Err(format!("fast and general JavaScript output differs for {:?}: {fast_output:?} vs {slow_output:?}", field.name).into());
-        }
-        compared += 1;
-    }
-    println!("DIFFERENTIAL_FILE={path}");
-    println!("DIFFERENTIAL_FIELDS={compared}");
-    println!("DIFFERENTIAL_EDITABLE_FIELDS={editable_fields}");
-    println!("DIFFERENTIAL_SHARD={shard}/{shard_count}");
-    println!("DIFFERENTIAL_ACTIONFUL={actionful}");
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::differential;
-
-    #[test]
-    #[ignore = "requires the SF-85P corpus file and compares all editable fields"]
-    fn sf85p_every_editable_field_matches_the_full_xfa_path() {
-        let path = std::env::var("PDFCRAFT_SF85P_PATH").expect("set PDFCRAFT_SF85P_PATH to the SF-85P corpus file");
-        differential(&path).expect("fast and full XFA edit paths should match for every editable field");
-    }
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let journey = args.next().ok_or("usage: edit_bench pages|form|open-real|edit-real|form-real|save-real|verify-real [FILE] [FIELD|OUTPUT]")?;
@@ -212,9 +95,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         return verify_saved_pdf(file.as_deref().ok_or("verify-real needs a saved PDF path")?);
     }
     let (field_name, output_path) = if journey == "save-real" { (args.next(), next) } else { (next, None) };
-    if journey == "differential" {
-        return differential(file.as_deref().ok_or("usage: edit_bench differential FILE")?);
-    }
     let (pages, fields) = match journey.as_str() {
         "pages" if file.is_none() => (PAGE_COUNT, 0),
         "form" if file.is_none() => (1, FIELD_COUNT),

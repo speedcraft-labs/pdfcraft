@@ -125,21 +125,6 @@ fn field_membership_is_refreshed_even_when_discovery_is_cached() {
 }
 
 #[test]
-fn content_signature_refresh_reuses_only_unchanged_widget_locations() {
-    let mut doc = fixture(&[STAMP, "<< /FT /Sig /T (Approval) /V 3 0 R >>"]);
-    let mut form = Dict::new();
-    form.set(b"Fields".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(4, 0))]));
-    doc.update_dict(doc.root().unwrap(), |d| d.set(b"AcroForm".to_vec(), Object::Dict(form))).unwrap();
-
-    let cache = DigestCache::default();
-    let trust = TrustStore::default();
-    let previous = list_cached(&doc, doc.bytes(), &trust, &cache);
-    let full = list_cached(&doc, doc.bytes(), &trust, &cache);
-    let reused = list_cached_after_content_edit(&doc, doc.bytes(), &trust, &cache, &previous);
-    assert_eq!(format!("{reused:?}"), format!("{full:?}"));
-}
-
-#[test]
 fn reopened_incremental_and_renumbered_sources_get_fresh_discovery() {
     let mut doc = fixture(&["<< /Ignored true >>", STAMP]);
     doc.update_dict(doc.root().unwrap(), |d| d.set(b"Unknown".to_vec(), Object::Ref(ObjRef::new(4, 0)))).unwrap();
@@ -187,8 +172,9 @@ fn reconstructed_and_unreadable_objects_are_not_cached_as_complete() {
         assert_eq!(cache.timestamp_candidates(&repaired), vec![ObjRef::new(3, 0)]);
     }
     // A single invalid keyword immediately before endobj is deliberately recovered as
-    // Null by parse_indirect. Use a stream without endstream to exercise a real read error.
-    let unreadable = fixture(&[STAMP, "<< /Length 0 >>\nstream\nunterminated"]);
+    // Null by parse_indirect. Use a stream with neither endstream nor /Length to exercise a real
+    // read error (with a /Length that fits, the stream is that many bytes).
+    let unreadable = fixture(&[STAMP, "<< >>\nstream\nunterminated"]);
     assert!(unreadable.repair_log().is_empty());
     assert!(unreadable.try_get(4).is_err());
     assert!(unreadable.scan_objects_checked().any(|(r, object)| r.num == 4 && object.is_err()));
