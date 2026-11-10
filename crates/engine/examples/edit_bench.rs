@@ -270,10 +270,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
         let output = output_path.as_deref().ok_or("save-real needs an output path")?;
         let start = Instant::now();
-        let bytes = session.save_bytes(id)?;
-        std::fs::write(output, bytes.as_ref())?;
+        session.save_in_place(id, output)?;
         samples.push(start.elapsed().as_nanos());
-        output_digest = Some(digest(bytes.as_ref()));
+        output_digest = Some(digest(&std::fs::read(output)?));
     } else {
         for run in 0..RUNS {
             let start = Instant::now();
