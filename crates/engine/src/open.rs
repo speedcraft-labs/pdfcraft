@@ -8,8 +8,7 @@ use pdfcraft_render::{DocInfo, OpenError, RenderConfig, RenderPool, inspect};
 use crate::history::{Editor, Keys, TextBlocksCache};
 use crate::{
     AppearanceCache, DocId, Document, Session, TrustStore, XFA_SCRIPTS_OFF, XfaLayout, display_bytes, display_config, guard, info_fields, js,
-    note_warnings, recovered_render_password, render_threads, same_pages, signatures_of, xfa, xfa_dataset_warnings, xfa_initial_dataset_dirty_fields,
-    xfa_layout, xfa_values_from_datasets,
+    note_warnings, recovered_render_password, render_threads, same_pages, signatures_of, xfa, xfa_layout, xfa_values_from_datasets_with_template,
 };
 
 /// Immutable session state needed while a document is prepared away from its owning thread.
@@ -118,18 +117,18 @@ impl Session {
             let new_cos = pdfcraft_cos::Document::open_with_password(new_bytes.clone(), password).map_err(|e| e.to_string())?;
             Ok((new_bytes, new_info, new_cos))
         };
-        let (bytes, info, cos, xfa) = match (info.xfa, cos) {
+        let (bytes, info, cos, xfa, parsed_xfa_data_template) = match (info.xfa, cos) {
             (Some(pdfcraft_render::Xfa::Dynamic), Ok(Ok(cos))) if pdfcraft_xfa::existing_layout(&cos).is_none() => {
                 let mut work = cos.clone();
                 let laid_out = guard(|| xfa_layout(&mut work))
                     .unwrap_or_else(|m| Err(format!("laying it out failed unexpectedly ({m})")))
                     .and_then(|report| rebase(&work).map(|(b, i, c)| (b, i, c, report)));
                 match laid_out {
-                    Ok((b, i, c, report)) => (b, i, Ok(Ok(c)), Some(report)),
+                    Ok((b, i, c, report)) => (b, i, Ok(Ok(c)), Some(report), None),
                     Err(e) => {
                         let mut info = info;
                         info.warnings.push(format!("This dynamic XFA form could not be laid out: {e}"));
-                        (bytes, info, Ok(Ok(cos)), None)
+                        (bytes, info, Ok(Ok(cos)), None, None)
                     }
                 }
             }
@@ -137,11 +136,14 @@ impl Session {
             // filled in by another viewer since; give the fields those values.
             (Some(_), Ok(Ok(cos))) => {
                 let report = pdfcraft_xfa::existing_layout(&cos);
+                // Dataset-value synchronization also needs the template. Reuse this parsed
+                // instance below instead of parsing the same XFA packet a second time.
+                let xfa_data_template = xfa::data_template(&cos);
                 let mut work = cos.clone();
-                let synced =
-                    guard(|| xfa_values_from_datasets(&mut work)).unwrap_or_else(|m| Err(format!("reading its data failed unexpectedly ({m})")));
+                let synced = guard(|| xfa_values_from_datasets_with_template(&mut work, xfa_data_template.as_deref()))
+                    .unwrap_or_else(|m| Err(format!("reading its data failed unexpectedly ({m})")));
                 match synced {
-                    Ok(names) if names.is_empty() => (bytes, info, Ok(Ok(cos)), report),
+                    Ok(names) if names.is_empty() => (bytes, info, Ok(Ok(cos)), report, Some(xfa_data_template)),
                     Ok(names) => match rebase(&work) {
                         Ok((b, mut i, c)) => {
                             // The fields were rewritten from the XFA data: say so, and which.
@@ -153,31 +155,31 @@ impl Session {
                                 if names.len() == 1 { "" } else { "s" },
                                 shown.join(", ")
                             ));
-                            (b, i, Ok(Ok(c)), report)
+                            (b, i, Ok(Ok(c)), report, Some(xfa_data_template))
                         }
                         Err(e) => {
                             let mut info = info;
                             info.warnings.push(format!("The values in this form's XFA data could not be applied: {e}"));
-                            (bytes, info, Ok(Ok(cos)), report)
+                            (bytes, info, Ok(Ok(cos)), report, Some(xfa_data_template))
                         }
                     },
                     Err(e) => {
                         let mut info = info;
                         info.warnings.push(format!("The values in this form's XFA data could not be applied: {e}"));
-                        (bytes, info, Ok(Ok(cos)), report)
+                        (bytes, info, Ok(Ok(cos)), report, Some(xfa_data_template))
                     }
                 }
             }
-            (_, cos) => (bytes, info, cos, None),
+            (_, cos) => (bytes, info, cos, None, None),
         };
         // A laid-out XFA form: its initialize and calculate scripts run now, as on opening in
         // Acrobat; what they change is one more revision, still nothing to save.
         let mut script_output = js::JsOutput::default();
         let mut ran_away = false;
-        let xfa_data_template = match (info.xfa.as_ref(), &cos) {
+        let xfa_data_template = parsed_xfa_data_template.unwrap_or_else(|| match (info.xfa.as_ref(), &cos) {
             (Some(_), Ok(Ok(c))) => xfa::data_template(c),
             _ => None,
-        };
+        });
         let xfa_template = xfa_data_template.clone().filter(|template| pdfcraft_xfa::has_scripts(template));
         let (bytes, info, cos) = match (&xfa, cos) {
             (Some(_), Ok(Ok(cos))) if !context.js_off => match xfa_template.clone() {
@@ -262,18 +264,10 @@ impl Session {
         document.xfa_template = if ran_away { None } else { xfa_template };
         document.xfa_data_template = xfa_data_template;
         if document.info.xfa.is_some() {
-            document.xfa_initial_dataset_dirty = document
-                .editor
-                .as_ref()
-                .map(|editor| xfa_initial_dataset_dirty_fields(&editor.cos, document.xfa_data_template.as_deref(), &document.form))
-                .unwrap_or_default();
             document.xfa_edit_plan = document
                 .editor
                 .as_ref()
                 .and_then(|editor| document.xfa_template.as_deref().map(|template| xfa::xfa_edit_plan(&editor.cos, template)));
-            document.xfa_dataset_warnings = document.editor.as_ref().and_then(|editor| {
-                xfa_dataset_warnings(&editor.cos, document.xfa_data_template.as_deref(), &document.form).ok().and_then(|(cache, _)| cache)
-            });
         }
         document.js_output.append(script_output);
         if ran_away {
@@ -373,6 +367,7 @@ impl Session {
             xfa_template: None,
             xfa_data_template: None,
             xfa_initial_dataset_dirty: Default::default(),
+            xfa_initial_dataset_dirty_computed: false,
             xfa_dataset_warnings: None,
             xfa_edit_plan: None,
             xfa_scripts_off: false,

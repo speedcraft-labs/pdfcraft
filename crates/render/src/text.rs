@@ -90,34 +90,13 @@ pub fn fold_case(s: &str) -> String {
 }
 
 /// The text of one page, in content order, with line structure.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PageText {
     pub glyphs: Vec<TextGlyph>,
     /// For each glyph: its line index (lines are in reading order, top to bottom).
     pub line_of: Vec<u32>,
     /// `true` when a word break precedes the glyph on the same line.
     pub space_before: Vec<bool>,
-    /// Folded search forms, kept across queries (#128). Derived from the fields above, so it is
-    /// neither compared nor carried over by `clone`: a cloned page simply starts cold.
-    fold_cache: search::FoldCache,
-}
-
-// The fold cache is derived state; pages are compared and cloned for their content alone.
-impl Clone for PageText {
-    fn clone(&self) -> Self {
-        Self {
-            glyphs: self.glyphs.clone(),
-            line_of: self.line_of.clone(),
-            space_before: self.space_before.clone(),
-            fold_cache: search::FoldCache::default(),
-        }
-    }
-}
-
-impl PartialEq for PageText {
-    fn eq(&self, other: &Self) -> bool {
-        self.glyphs == other.glyphs && self.line_of == other.line_of && self.space_before == other.space_before
-    }
 }
 
 impl PageText {
@@ -162,13 +141,6 @@ impl PageText {
     /// Search with Acrobat's find options, returning at most `limit` glyph ranges.
     pub fn find_opts_limited(&self, needle: &str, case_sensitive: bool, whole_words: bool, limit: usize) -> Vec<std::ops::Range<usize>> {
         search::find(self, needle, case_sensitive, whole_words, limit)
-    }
-
-    /// The page's text in literal-search form — case folded unless `sensitive`, whitespace runs
-    /// collapsed to single spaces — each character with its owning glyph index, cached across
-    /// queries so only the first query per options folds (#128).
-    fn folded_form(&self, sensitive: bool) -> std::sync::Arc<search::FoldedPage> {
-        self.fold_cache.lookup_or_build(self, search::FoldOptions { sensitive })
     }
 
     /// Glyph ranges of the matches a character matcher finds in the page text (words and lines

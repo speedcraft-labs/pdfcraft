@@ -4,7 +4,7 @@ use super::{
     Arc, DocId, Document, Edit, EditCtx, EditError, Label, MAX_UNDO, ObjectKind, OnceLock, RenderPool, SaveOptions, Scope, Session,
     XFA_REMOVED_PREFIX, XFA_SCRIPTS_OFF, check_permission, comment_list, display_bytes, display_config, guard, info_fields, inspect, js, keys_after,
     note_warnings, render_threads, run_edit, scan_colours, scope_of, shown_under_redactions, signatures_of, sync_xfa_state, undrawn_notices,
-    undrawn_notices_for_fields, uses_scripts, write_incremental, xfa, xfa_sync_changed_datasets, xfa_sync_datasets,
+    undrawn_notices_for_fields, uses_scripts, write_incremental, xfa, xfa_initial_dataset_dirty_fields, xfa_sync_changed_datasets, xfa_sync_datasets,
 };
 use crate::{EditNotice, MarkKind};
 
@@ -317,6 +317,14 @@ impl Session {
         let js_off = self.js_off;
         let xfa_time_scale = self.xfa_time_scale.unwrap_or(1);
         let doc = self.doc_mut(id)?;
+        if doc.info.xfa.is_some() && !doc.xfa_initial_dataset_dirty_computed {
+            doc.xfa_initial_dataset_dirty = doc
+                .editor
+                .as_ref()
+                .map(|editor| xfa_initial_dataset_dirty_fields(&editor.cos, doc.xfa_data_template.as_deref(), &doc.form))
+                .unwrap_or_default();
+            doc.xfa_initial_dataset_dirty_computed = true;
+        }
         doc.edit_notices.clear();
         let name = doc.name.clone();
         let is_xfa = doc.info.xfa.is_some();

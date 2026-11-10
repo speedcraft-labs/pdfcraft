@@ -204,14 +204,18 @@ impl JsRunner {
     /// an XFA form) and its document-level scripts, read once.
     pub fn new(cos: &pdfcraft_cos::Document, file_name: &str) -> JsRunner {
         let xfa = pdfcraft_xfa::xfa_shape(cos).is_some();
-        let doc =
-            pdfcraft_js::DocInfo { file_name: file_name.to_string(), num_pages: pdfcraft_model::pages(cos).len(), page: 0, info: info(cos), xfa };
         // Once XFA owns the form, the PDF container's scripts belong to its fallback view.
         // Keep them in the file and in Document JavaScripts, but do not initialize an
         // AcroForm context with them: a viewer-compatibility alert would be misleading.
         // Packets alone are not enough: static XFA and an unlaid-out shell keep their scripts.
         let xfa_active = xfa && pdfcraft_xfa::existing_layout(cos).is_some();
         let doc_scripts = if xfa_active { Vec::new() } else { pdfcraft_forms::document_scripts(cos) };
+        Self::with_document_scripts(cos, file_name, xfa, doc_scripts)
+    }
+
+    fn with_document_scripts(cos: &pdfcraft_cos::Document, file_name: &str, xfa: bool, doc_scripts: Vec<String>) -> JsRunner {
+        let doc =
+            pdfcraft_js::DocInfo { file_name: file_name.to_string(), num_pages: pdfcraft_model::pages(cos).len(), page: 0, info: info(cos), xfa };
         JsRunner {
             doc,
             doc_scripts,
@@ -400,22 +404,30 @@ pub fn document_scripts(cos: &pdfcraft_cos::Document) -> Vec<(String, String)> {
     pdfcraft_forms::document_scripts_named(cos)
 }
 
+/// A catalog JavaScript name tree is enough to rule out precomputing pure field calculations:
+/// document scripts run before them and can affect the result. Avoid decoding every script while
+/// opening the PDF just to discover that the cache cannot be used.
+fn has_document_script_tree(cos: &pdfcraft_cos::Document) -> bool {
+    let Some(root) = cos.root() else { return false };
+    let catalog = cos.get(root);
+    let Some(names) = catalog.as_dict().and_then(|d| d.get(b"Names")).map(|n| cos.resolve(n)) else { return false };
+    names.as_dict().and_then(|d| d.get(b"JavaScript")).is_some()
+}
+
 /// Compute safe Calculate script baselines on a private graph while opening a regular AcroForm.
 /// The open document keeps its stored values; the cache lets later edits avoid repeating pure
 /// calculations whose field inputs have not changed.
 pub(crate) fn precompute_calculation_cache(cos: &pdfcraft_cos::Document, file_name: &str) -> CalculationCache {
-    if pdfcraft_xfa::existing_layout(cos).is_some() {
+    if pdfcraft_xfa::existing_layout(cos).is_some() || has_document_script_tree(cos) {
         return CalculationCache::default();
     }
-    let mut graph = cos.clone();
-    let mut runner = JsRunner::new(&graph, file_name);
-    if !runner.doc_scripts.is_empty() {
-        return CalculationCache::default();
-    }
-    let fields = pdfcraft_forms::fields(&graph);
+    let fields = pdfcraft_forms::fields(cos);
     if !fields.iter().any(|field| field.actions.scripts.calculate.is_some()) {
         return CalculationCache::default();
     }
+    let mut graph = cos.clone();
+    let xfa = pdfcraft_xfa::xfa_shape(cos).is_some();
+    let mut runner = JsRunner::with_document_scripts(&graph, file_name, xfa, Vec::new());
     let _ = pdfcraft_forms::recalculate_with(&mut graph, &mut runner);
     runner.calculation_cache
 }
@@ -671,10 +683,7 @@ mod review_tests {
         };
         let mut glyphs: Vec<_> = (0..n).map(|i| glyph(i, "_")).collect();
         glyphs.push(glyph(n, "x"));
-        let mut text = pdfcraft_render::PageText::default();
-        text.line_of = vec![0; glyphs.len()];
-        text.space_before = vec![false; glyphs.len()];
-        text.glyphs = glyphs;
+        let text = pdfcraft_render::PageText { line_of: vec![0; glyphs.len()], space_before: vec![false; glyphs.len()], glyphs };
         UNDERSCORE_CHARS_READ.with(|c| c.set(0));
         let words = words_with(&text, |x, y| [x, y]);
         assert_eq!(words.iter().map(|(w, _)| w.len()).collect::<Vec<_>>(), [n, 1]);
