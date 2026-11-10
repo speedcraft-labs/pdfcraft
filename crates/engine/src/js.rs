@@ -404,15 +404,21 @@ pub fn document_scripts(cos: &pdfcraft_cos::Document) -> Vec<(String, String)> {
     pdfcraft_forms::document_scripts_named(cos)
 }
 
+/// A catalog JavaScript name tree is enough to rule out precomputing pure field calculations:
+/// document scripts run before them and can affect the result. Avoid decoding every script while
+/// opening the PDF just to discover that the cache cannot be used.
+fn has_document_script_tree(cos: &pdfcraft_cos::Document) -> bool {
+    let Some(root) = cos.root() else { return false };
+    let catalog = cos.get(root);
+    let Some(names) = catalog.as_dict().and_then(|d| d.get(b"Names")).map(|n| cos.resolve(n)) else { return false };
+    names.as_dict().and_then(|d| d.get(b"JavaScript")).is_some()
+}
+
 /// Compute safe Calculate script baselines on a private graph while opening a regular AcroForm.
 /// The open document keeps its stored values; the cache lets later edits avoid repeating pure
 /// calculations whose field inputs have not changed.
 pub(crate) fn precompute_calculation_cache(cos: &pdfcraft_cos::Document, file_name: &str) -> CalculationCache {
-    if pdfcraft_xfa::existing_layout(cos).is_some() {
-        return CalculationCache::default();
-    }
-    let doc_scripts = pdfcraft_forms::document_scripts(cos);
-    if !doc_scripts.is_empty() {
+    if pdfcraft_xfa::existing_layout(cos).is_some() || has_document_script_tree(cos) {
         return CalculationCache::default();
     }
     let fields = pdfcraft_forms::fields(cos);
@@ -421,7 +427,7 @@ pub(crate) fn precompute_calculation_cache(cos: &pdfcraft_cos::Document, file_na
     }
     let mut graph = cos.clone();
     let xfa = pdfcraft_xfa::xfa_shape(cos).is_some();
-    let mut runner = JsRunner::with_document_scripts(&graph, file_name, xfa, doc_scripts);
+    let mut runner = JsRunner::with_document_scripts(&graph, file_name, xfa, Vec::new());
     let _ = pdfcraft_forms::recalculate_with(&mut graph, &mut runner);
     runner.calculation_cache
 }
