@@ -215,6 +215,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if journey == "differential" {
         return differential(file.as_deref().ok_or("usage: edit_bench differential FILE")?);
     }
+    let save_target = if journey == "save-real" {
+        let source = file.as_deref().ok_or("save-real needs an input file")?;
+        let target = output_path.as_deref().ok_or("save-real needs an output path")?;
+        std::fs::copy(source, target)?;
+        Some(target.to_owned())
+    } else {
+        None
+    };
     let (pages, fields) = match journey.as_str() {
         "pages" if file.is_none() => (PAGE_COUNT, 0),
         "form" if file.is_none() => (1, FIELD_COUNT),
@@ -222,13 +230,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         "pages-real" | "form-real" | "open-real" | "edit-real" | "save-real" if file.is_some() => (0, 0),
         _ => return Err(format!("unknown journey {journey:?}").into()),
     };
-    let input = match file {
-        Some(ref path) => Arc::new(std::fs::read(path)?),
+    let input = match save_target.as_deref().or(file.as_deref()) {
+        Some(path) => Arc::new(std::fs::read(path)?),
         None => Arc::new(pdf(pages, fields)),
     };
     let mut session = Session::new().with_clock(fixed_clock);
     let open_start = Instant::now();
-    let id = session.open(file.as_deref().unwrap_or("synthetic-edit.pdf"), None, input, None)?;
+    let id = session.open(save_target.as_deref().or(file.as_deref()).unwrap_or("synthetic-edit.pdf"), None, input, None)?;
     let open_ns = open_start.elapsed().as_nanos();
     let selected_field = if journey == "form-real" || journey == "edit-real" || journey == "save-real" {
         let doc = session.get(id).ok_or("the document did not open")?;
