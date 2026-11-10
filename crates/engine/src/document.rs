@@ -55,6 +55,8 @@ pub struct Document {
     pub(crate) xfa_data_template: Option<Arc<pdfcraft_xfa::model::Template>>,
     /// Field values that disagreed with XFA datasets at open and must join later dirty writes.
     pub(crate) xfa_initial_dataset_dirty: std::collections::HashSet<String>,
+    /// Whether the original dataset differences have been collected for the first edit.
+    pub(crate) xfa_initial_dataset_dirty_computed: bool,
     /// Full-sync XFA dataset warnings for the values present when the document was opened.
     pub(crate) xfa_dataset_warnings: Option<crate::xfa_form::XfaDatasetWarningCache>,
     /// Script event and calculation dependencies for the current XFA structure.

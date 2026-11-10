@@ -6283,6 +6283,7 @@ fn an_xfa_form_without_fields_that_forbids_dynamic_rendering_keeps_its_pages() {
     let doc = s.get(id).unwrap();
     assert_eq!(doc.info.xfa, Some(pdfcraft_render::Xfa::Static));
     assert!(doc.xfa.is_none(), "nothing was laid out");
+    assert!(!doc.xfa_initial_dataset_dirty_computed, "the full field/data comparison waits until the first edit");
     assert_eq!(doc.bytes[..], original[..], "no revision was appended on open");
     assert_eq!(doc.info.pages.len(), 1);
     // The same form without the config is still taken to be dynamic: laid out from the template
@@ -6311,6 +6312,7 @@ fn static_xfa_forms_take_their_values_from_the_datasets_and_write_them_back() {
     let note = doc.info.warnings.iter().find(|w| w.contains("taken from this form's XFA data")).expect("a warning");
     assert!(note.starts_with("2 form field values") && note.contains("form1[0].page1[0].name[0]"), "{note}");
     s.apply(id, Edit::SetFieldValue { name: "form1[0].page1[0].name[0]".into(), value: FieldValue::Text("Grace".into()) }).unwrap();
+    assert!(s.get(id).unwrap().xfa_initial_dataset_dirty_computed, "the first edit records original dataset differences");
     s.apply(id, Edit::SetFieldValue { name: "form1[0].page1[0].agree[0]".into(), value: FieldValue::Check(false) }).unwrap();
     let saved = s.save_bytes(id).unwrap();
     let cos = pdfcraft_cos::Document::open(saved.clone()).unwrap();

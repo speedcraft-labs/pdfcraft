@@ -417,6 +417,7 @@ pub(crate) fn sync_xfa_state(doc: &mut Document) {
             doc.xfa_template = None;
             doc.xfa_data_template = None;
             doc.xfa_initial_dataset_dirty.clear();
+            doc.xfa_initial_dataset_dirty_computed = true;
             // Only what the strip said stays (the XFA's own warnings no longer apply).
             doc.xfa_warnings.retain(|w| w.starts_with(XFA_REMOVED_PREFIX));
         }
