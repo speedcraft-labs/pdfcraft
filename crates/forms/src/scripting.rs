@@ -38,10 +38,13 @@ impl FieldEvent {
 pub struct FieldChange {
     pub name: String,
     pub value: Option<Vec<String>>,
+    /// This value came from a Calculate script; redraw it through the field's Format script.
+    pub formatted: bool,
     pub read_only: Option<bool>,
     pub required: Option<bool>,
     /// `display.visible` 0, `hidden` 1, `noPrint` 2, `noView` 3.
     pub display: Option<i32>,
+    pub caption: Option<String>,
     /// Move/resize the first widget, in PDF user space.
     pub rect: Option<[f64; 4]>,
 }
@@ -101,7 +104,7 @@ pub(crate) fn accept(doc: &mut Document, f: &Field, value: &str, scripts: &mut d
         let Some(js) = script else { continue };
         let all = fields(doc);
         let r = scripts.run(event, js, f, &v, &all);
-        apply_changes(doc, &r.changes, &f.name)?;
+        apply_changes(doc, &r.changes, &f.name, scripts)?;
         if !r.rc {
             return Err(FormError::Invalid(r.message.unwrap_or_else(|| format!("{default} [ {} ]", f.name))));
         }
@@ -125,9 +128,9 @@ pub(crate) fn formatted_in_english(doc: &Document, f: &Field, value: &str, scrip
 }
 
 /// Apply script changes to other fields (values written without re-running their scripts;
-/// read-only, required and visibility as flags). `except` is the event's own field, whose value
-/// the event sets.
-pub(crate) fn apply_changes(doc: &mut Document, changes: &[FieldChange], except: &str) -> Result<(), FormError> {
+/// read-only, required and visibility as flags; button captions). `except` is the event's own
+/// field, whose value the event sets.
+pub(crate) fn apply_changes(doc: &mut Document, changes: &[FieldChange], except: &str, scripts: &mut dyn Scripts) -> Result<(), FormError> {
     if changes.is_empty() {
         return Ok(());
     }
@@ -139,16 +142,21 @@ pub(crate) fn apply_changes(doc: &mut Document, changes: &[FieldChange], except:
             && *v != f.value
         {
             let value = match f.kind {
-                FieldKind::Text => FieldValue::Text(v.first().cloned().unwrap_or_default()),
-                FieldKind::CheckBox => f.check_box_value(v.first().map(String::as_str)),
-                FieldKind::Radio => FieldValue::Radio(v.first().cloned()),
-                FieldKind::Combo | FieldKind::List => FieldValue::Choice(v.clone()),
-                _ => continue,
+                FieldKind::Text => Some(FieldValue::Text(v.first().cloned().unwrap_or_default())),
+                FieldKind::CheckBox => Some(f.check_box_value(v.first().map(String::as_str))),
+                FieldKind::Radio => Some(FieldValue::Radio(v.first().cloned())),
+                FieldKind::Combo | FieldKind::List => Some(FieldValue::Choice(v.clone())),
+                _ => None,
             };
-            let mut tmp = f.clone();
-            tmp.flags &= !flags::NO_TOGGLE_TO_OFF;
-            tmp.actions = Default::default();
-            crate::write_value(doc, &tmp, &value, &mut NoScripts)?;
+            if let Some(value) = value {
+                let mut tmp = f.clone();
+                tmp.flags &= !flags::NO_TOGGLE_TO_OFF;
+                tmp.actions = Default::default();
+                crate::write_value(doc, &tmp, &value, &mut NoScripts)?;
+                if c.formatted {
+                    crate::redraw_calculated_value(doc, f, v, scripts)?;
+                }
+            }
         }
         let mut ff = f.flags;
         for (on, bit) in [(c.read_only, flags::READ_ONLY), (c.required, flags::REQUIRED)] {
@@ -177,6 +185,12 @@ pub(crate) fn apply_changes(doc: &mut Document, changes: &[FieldChange], except:
                 }
             }
         }
+        if let Some(caption) = &c.caption {
+            if f.kind != FieldKind::PushButton {
+                return Err(FormError::Invalid(format!("{} is not a push button", f.name)));
+            }
+            crate::set_props(doc, &f.name, &crate::FieldProps { caption_all: Some(caption.clone()), ..Default::default() })?;
+        }
         if let Some(rect) = c.rect {
             crate::set_props(doc, &c.name, &crate::FieldProps { rect: Some((0, rect)), ..Default::default() })?;
         }
@@ -187,7 +201,7 @@ pub(crate) fn apply_changes(doc: &mut Document, changes: &[FieldChange], except:
 /// Apply what a button or console script changed (values, read-only, required, visibility),
 /// then recalculate.
 pub fn apply_script_changes(doc: &mut Document, changes: &[FieldChange], scripts: &mut dyn Scripts) -> Result<(), FormError> {
-    apply_changes(doc, changes, "")?;
+    apply_changes(doc, changes, "", scripts)?;
     crate::recalculate_with(doc, scripts)?;
     Ok(())
 }
