@@ -517,6 +517,15 @@ pub(crate) fn xfa_after_data_change(doc: &mut pdfcraft_cos::Document, cx: &mut E
 /// Give the fields the values the XFA datasets hold (a form filled in another viewer). Returns
 /// the names of the fields that changed.
 pub(crate) fn xfa_values_from_datasets(doc: &mut pdfcraft_cos::Document) -> Result<Vec<String>, String> {
+    xfa_values_from_datasets_with_template(doc, None)
+}
+
+/// Give the fields the values the XFA datasets hold, reusing a template already parsed by the
+/// caller when available.
+pub(crate) fn xfa_values_from_datasets_with_template(
+    doc: &mut pdfcraft_cos::Document,
+    tpl: Option<&pdfcraft_xfa::model::Template>,
+) -> Result<Vec<String>, String> {
     let data = xfa_field_data(doc);
     let fields = pdfcraft_forms::fields(doc);
     // The first field of each name, as a lookup by name would find it.
@@ -525,7 +534,7 @@ pub(crate) fn xfa_values_from_datasets(doc: &mut pdfcraft_cos::Document) -> Resu
         by_name.entry(f.name.as_str()).or_insert(f);
     }
     let mut updates = Vec::new();
-    for (name, value) in pdfcraft_xfa::read_values(doc, &data) {
+    for (name, value) in pdfcraft_xfa::read_values_with(doc, tpl, &data) {
         let Some(f) = by_name.get(name.as_str()) else { continue };
         let new = match value {
             pdfcraft_xfa::FieldData::Text(t) if matches!(f.kind, pdfcraft_forms::FieldKind::Combo | pdfcraft_forms::FieldKind::List) => {
