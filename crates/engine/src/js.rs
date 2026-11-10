@@ -204,14 +204,18 @@ impl JsRunner {
     /// an XFA form) and its document-level scripts, read once.
     pub fn new(cos: &pdfcraft_cos::Document, file_name: &str) -> JsRunner {
         let xfa = pdfcraft_xfa::xfa_shape(cos).is_some();
-        let doc =
-            pdfcraft_js::DocInfo { file_name: file_name.to_string(), num_pages: pdfcraft_model::pages(cos).len(), page: 0, info: info(cos), xfa };
         // Once XFA owns the form, the PDF container's scripts belong to its fallback view.
         // Keep them in the file and in Document JavaScripts, but do not initialize an
         // AcroForm context with them: a viewer-compatibility alert would be misleading.
         // Packets alone are not enough: static XFA and an unlaid-out shell keep their scripts.
         let xfa_active = xfa && pdfcraft_xfa::existing_layout(cos).is_some();
         let doc_scripts = if xfa_active { Vec::new() } else { pdfcraft_forms::document_scripts(cos) };
+        Self::with_document_scripts(cos, file_name, xfa, doc_scripts)
+    }
+
+    fn with_document_scripts(cos: &pdfcraft_cos::Document, file_name: &str, xfa: bool, doc_scripts: Vec<(String, String)>) -> JsRunner {
+        let doc =
+            pdfcraft_js::DocInfo { file_name: file_name.to_string(), num_pages: pdfcraft_model::pages(cos).len(), page: 0, info: info(cos), xfa };
         JsRunner {
             doc,
             doc_scripts,
@@ -407,15 +411,17 @@ pub(crate) fn precompute_calculation_cache(cos: &pdfcraft_cos::Document, file_na
     if pdfcraft_xfa::existing_layout(cos).is_some() {
         return CalculationCache::default();
     }
-    let mut graph = cos.clone();
-    let mut runner = JsRunner::new(&graph, file_name);
-    if !runner.doc_scripts.is_empty() {
+    let doc_scripts = document_scripts(cos);
+    if !doc_scripts.is_empty() {
         return CalculationCache::default();
     }
-    let fields = pdfcraft_forms::fields(&graph);
+    let fields = pdfcraft_forms::fields(cos);
     if !fields.iter().any(|field| field.actions.scripts.calculate.is_some()) {
         return CalculationCache::default();
     }
+    let mut graph = cos.clone();
+    let xfa = pdfcraft_xfa::xfa_shape(cos).is_some();
+    let mut runner = JsRunner::with_document_scripts(&graph, file_name, xfa, doc_scripts);
     let _ = pdfcraft_forms::recalculate_with(&mut graph, &mut runner);
     runner.calculation_cache
 }
