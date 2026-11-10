@@ -169,11 +169,7 @@ fn line(chars: &str, x: f32, y: f32, w: f32, em: f32, direction: [f32; 2]) -> Pa
         })
         .collect::<Vec<_>>();
     let n = glyphs.len();
-    let mut page = PageText::default();
-    page.glyphs = glyphs;
-    page.line_of = vec![0; n];
-    page.space_before = vec![false; n];
-    page
+    PageText { glyphs, line_of: vec![0; n], space_before: vec![false; n] }
 }
 
 fn annotation(subtype: &str, contents: Option<&str>, fill_sign: bool) -> Annotation {
