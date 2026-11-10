@@ -205,7 +205,7 @@ mod tests {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    let journey = args.next().ok_or("usage: edit_bench pages|form|open-real|edit-real|form-real|save-real|verify-real [FILE] [FIELD|OUTPUT]")?;
+    let journey = args.next().ok_or("usage: edit_bench pages|form|open-real|edit-real|review-edit-real|form-real|save-real|verify-real [FILE] [FIELD|OUTPUT]")?;
     let file = args.next();
     let next = args.next();
     if journey == "verify-real" {
@@ -219,7 +219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "pages" if file.is_none() => (PAGE_COUNT, 0),
         "form" if file.is_none() => (1, FIELD_COUNT),
         "pages" | "form" => return Err("synthetic journeys do not take a file".into()),
-        "pages-real" | "form-real" | "open-real" | "edit-real" | "save-real" if file.is_some() => (0, 0),
+        "pages-real" | "form-real" | "open-real" | "edit-real" | "review-edit-real" | "save-real" if file.is_some() => (0, 0),
         _ => return Err(format!("unknown journey {journey:?}").into()),
     };
     let input = match file {
@@ -265,6 +265,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let start = Instant::now();
         session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
         samples.push(start.elapsed().as_nanos());
+    } else if journey == "review-edit-real" {
+        let comment = session
+            .get(id)
+            .and_then(|doc| doc.info.annotations.iter().find(|annotation| annotation.subtype == "Text"))
+            .ok_or("PDF has no Text review annotation")?;
+        let page = comment.page;
+        let index = comment.index;
+        let text = format!("{} reviewed", comment.contents.as_deref().unwrap_or("Review note"));
+        let start = Instant::now();
+        session.apply(id, Edit::SetAnnotationContents { page, index, text })?;
+        samples.push(start.elapsed().as_nanos());
     } else if journey == "save-real" {
         let name = selected_field.as_ref().ok_or("PDF has no editable text field")?;
         session.apply(id, Edit::SetFieldValue { name: name.clone(), value: FieldValue::Text("1".into()) })?;
@@ -295,7 +306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     samples.sort_unstable();
     let doc = session.get(id).ok_or("the document disappeared")?;
-    let reported_ns = if journey == "open-real" || journey == "edit-real" || journey == "save-real" { samples[0] } else { samples[RUNS / 2] };
+    let reported_ns = if journey == "open-real" || journey == "edit-real" || journey == "review-edit-real" || journey == "save-real" { samples[0] } else { samples[RUNS / 2] };
     let output_identity = if journey == "edit-real" {
         let name = selected_field.as_deref().ok_or("PDF has no editable text field")?;
         let field = doc.form.iter().find(|field| field.name == name).ok_or("the edited PDF field disappeared")?;
