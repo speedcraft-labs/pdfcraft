@@ -113,6 +113,11 @@ pub(crate) fn dialog(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     app.updates.updater.dismiss_status();
                 }
                 CheckResultResponse::CheckAgain => app.updates.check_requested = true,
+                // Temporary compatibility for measuring this older fork app against upstream
+                // craft-libs, whose update dialog includes this response.
+                CheckResultResponse::RestartToUpdate => {
+                    app.updates.updater.restart_to_update();
+                }
             }
         }
     }
