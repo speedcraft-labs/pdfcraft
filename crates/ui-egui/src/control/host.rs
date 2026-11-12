@@ -1,6 +1,13 @@
 use super::{Host, Reply, Value, json};
 
 impl Host for crate::PdfCraftApp {
+    fn raise_for_control(&mut self, ctx: &egui::Context) {
+        if let Some(raise) = self.raise_without_focus {
+            raise();
+        }
+        ctx.request_repaint();
+    }
+
     /// Cancel any in-progress pointer gesture in every open view.
     fn cancel_pointer_gestures(&mut self) {
         for view in &mut self.views {

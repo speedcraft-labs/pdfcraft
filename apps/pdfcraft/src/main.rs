@@ -46,6 +46,7 @@ mod settings;
 mod single_instance;
 mod startup;
 mod text_scale;
+mod window_raise;
 #[cfg(test)]
 #[path = "windows_manifest.rs"]
 mod windows_manifest;
@@ -274,7 +275,7 @@ fn main() -> eframe::Result {
     let first = if choice == RendererChoice::Gl { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu };
     let result = eframe::run_native(
         "PdfCraft",
-        native_options(launch.integrated, launch.window_controls.is_some(), first),
+        native_options(launch.integrated, launch.window_controls.is_some(), first, launch.control_file.is_some()),
         app_creator(
             launch.clone(),
             Rc::clone(&started),
@@ -292,7 +293,7 @@ fn main() -> eframe::Result {
             log::error!("the GPU renderer (wgpu) didn't start: {e}. Starting with OpenGL instead; set PDFCRAFT_RENDERER=gl to skip wgpu.");
             eframe::run_native(
                 "PdfCraft",
-                native_options(launch.integrated, launch.window_controls.is_some(), eframe::Renderer::Glow),
+                native_options(launch.integrated, launch.window_controls.is_some(), eframe::Renderer::Glow, launch.control_file.is_some()),
                 app_creator(
                     launch,
                     started,
@@ -332,7 +333,7 @@ fn retry_with_gl(choice: RendererChoice, app_started: bool) -> bool {
 }
 
 /// The window and renderer settings for one run.
-fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer) -> eframe::NativeOptions {
+fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer, agent: bool) -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PdfCraft")
         .with_inner_size([1440.0, 920.0])
@@ -356,13 +357,16 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
     if integrated {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
+    // Started for an agent (`--control`): open without taking the user's keyboard focus.
+    viewport = viewport.with_active(!agent);
     if app_frame {
         // The tab strip is the title bar (pdfcraft_ui_egui::window_controls).
         viewport = viewport.with_decorations(false);
     }
     let persistence_path = settings_dir().map(|d| d.join("app.ron"));
     // Set explicitly, so the renderer never depends on which one eframe defaults to.
-    let mut native = eframe::NativeOptions { viewport, persistence_path, renderer, ..Default::default() };
+    let mut native =
+        eframe::NativeOptions { viewport, persistence_path, renderer, event_loop_builder: agent_event_loop(agent), ..Default::default() };
     // PdfCraft installs its own last-resort system face (`PDFCRAFT_SYSTEM_FONTS`); eframe's
     // provider would read every installed face, including proprietary ones, into every UI pass.
     native.system_font_fallback = false;
@@ -370,6 +374,20 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
         configure_gpu(&mut native);
     }
     native
+}
+
+/// Driven by an agent (`--control`): don't activate the app on launch, so the user's keyboard
+/// focus stays where it is (macOS; winit activates ignoring other apps by default).
+fn agent_event_loop(agent: bool) -> Option<eframe::EventLoopBuilderHook> {
+    #[cfg(target_os = "macos")]
+    if agent {
+        return Some(Box::new(|b| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            b.with_activate_ignoring_other_apps(false);
+        }));
+    }
+    let _ = agent;
+    None
 }
 
 /// What the command line asked for, kept so a second run (with OpenGL) can start the same way.
@@ -451,6 +469,7 @@ fn app_creator<'a>(
     Box::new(move |cc| {
         started.set(true);
         let mut app = PdfCraftApp::new();
+        app.raise_without_focus = Some(window_raise::raise_without_focus);
         // First start (or settings from before Units existed): the region's unit.
         app.units = pdfcraft_ui_egui::units::Unit::system();
         #[cfg(target_os = "linux")]
