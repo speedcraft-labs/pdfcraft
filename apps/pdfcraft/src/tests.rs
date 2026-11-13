@@ -126,15 +126,15 @@ fn opengl_is_the_fallback_unless_a_renderer_was_chosen() {
     assert!(!retry_with_gl(RendererChoice::Wgpu, false));
     assert!(!retry_with_gl(RendererChoice::Gl, false));
     // Each run states its renderer rather than relying on eframe's default.
-    assert_eq!(native_options(false, false, eframe::Renderer::Wgpu).renderer, eframe::Renderer::Wgpu);
-    assert_eq!(native_options(false, false, eframe::Renderer::Glow).renderer, eframe::Renderer::Glow);
+    assert_eq!(native_options(false, false, eframe::Renderer::Wgpu, false).renderer, eframe::Renderer::Wgpu);
+    assert_eq!(native_options(false, false, eframe::Renderer::Glow, false).renderer, eframe::Renderer::Glow);
 }
 
 #[test]
 fn the_desktop_frame_is_turned_off_only_when_the_app_draws_one() {
     use super::native_options;
-    assert_eq!(native_options(false, false, eframe::Renderer::Glow).viewport.decorations, None);
-    assert_eq!(native_options(false, true, eframe::Renderer::Glow).viewport.decorations, Some(false));
+    assert_eq!(native_options(false, false, eframe::Renderer::Glow, false).viewport.decorations, None);
+    assert_eq!(native_options(false, true, eframe::Renderer::Glow, false).viewport.decorations, Some(false));
 }
 
 #[test]
@@ -143,13 +143,13 @@ fn the_window_and_windows_taskbar_icons_load_from_the_bundled_png() {
     assert!(icon.width > 0 && icon.height > 0);
     assert_eq!(icon.rgba.len(), (icon.width as usize) * (icon.height as usize) * 4);
     #[cfg(not(target_os = "windows"))]
-    assert_eq!(super::native_options(false, false, eframe::Renderer::Glow).viewport.icon.as_deref(), Some(&icon));
+    assert_eq!(super::native_options(false, false, eframe::Renderer::Glow, false).viewport.icon.as_deref(), Some(&icon));
     #[cfg(target_os = "windows")]
     {
         // None would load eframe's default icon; only the explicit empty sentinel prevents
         // its first-frame setter from overwriting our full-resolution ICON_BIG.
         for renderer in [eframe::Renderer::Glow, eframe::Renderer::Wgpu] {
-            let viewport = super::native_options(false, false, renderer).viewport;
+            let viewport = super::native_options(false, false, renderer, false).viewport;
             assert_eq!(viewport.icon.as_deref(), Some(&egui::IconData::default()));
         }
         assert_eq!((icon.width, icon.height), (256, 256));
@@ -340,7 +340,7 @@ fn a_gpu_error_while_a_window_is_set_up_is_returned_not_a_panic() {
     // than the device allows.
     use eframe::wgpu;
     let _gpu = gpu();
-    let native = super::native_options(false, false, eframe::Renderer::Wgpu);
+    let native = super::native_options(false, false, eframe::Renderer::Wgpu, false);
     let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &native.wgpu_options.wgpu_setup else { panic!("default setup creates its own instance") };
     let instance = pollster::block_on(native.wgpu_options.wgpu_setup.new_instance());
     let options = wgpu::RequestAdapterOptions { power_preference: setup.power_preference, ..Default::default() };
@@ -401,7 +401,7 @@ fn vendor_provenance_egui_wgpu_catch_errors_identity() {
 fn pipeline_creation_error_is_returned_and_device_remains_usable() {
     use eframe::{egui_wgpu, wgpu};
     let _gpu = gpu();
-    let mut native = super::native_options(false, false, eframe::Renderer::Wgpu);
+    let mut native = super::native_options(false, false, eframe::Renderer::Wgpu, false);
     let egui_wgpu::WgpuSetup::CreateNew(setup) = &native.wgpu_options.wgpu_setup else { panic!("default setup creates its own instance") };
     let instance = pollster::block_on(native.wgpu_options.wgpu_setup.new_instance());
     let options = wgpu::RequestAdapterOptions { power_preference: setup.power_preference, ..Default::default() };
