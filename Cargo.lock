@@ -4285,6 +4285,8 @@ dependencies = [
  "egui",
  "fmv-macos-events",
  "log",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
  "pdfcraft-engine",
  "pdfcraft-platform",
  "pdfcraft-ui-egui",

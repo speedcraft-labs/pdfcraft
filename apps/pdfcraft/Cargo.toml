@@ -27,6 +27,10 @@ log = { workspace = true }
 chrono = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# The control channel raises UI requests without activating PdfCraft (window_raise.rs).
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWindow"] }
+winit = { version = "0.30", default-features = false }
 # Finder double-click / Open With / Dock drops arrive as Apple events (#73); this small audited
 # crate registers the handler (Objective-C interop needs unsafe, which our workspace forbids)
 # behind a safe API. Same version as PhotoCraft. Pinned exactly: review the diff before bumping.

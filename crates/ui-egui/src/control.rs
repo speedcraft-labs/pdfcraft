@@ -268,6 +268,9 @@ pub(crate) trait Host {
 
     /// Drop transient app-owned grabs before widgets observe the canceled pointer as up.
     fn cancel_pointer_gestures(&mut self) {}
+
+    /// Raise the window for a control UI request without activating the app.
+    fn raise_for_control(&mut self, _ctx: &egui::Context) {}
 }
 
 impl Control {
@@ -422,6 +425,15 @@ impl Control {
 
     /// `since` is the request's arrival time: the one admission deadline it was admitted under.
     fn dispatch(&mut self, ctx: &egui::Context, host: &mut impl Host, req: ControlRequest, since: web_time::Instant) {
+        if req.method.starts_with("ui.") {
+            if req.method == "ui.focus" {
+                // Explicit request: activate the app and take keyboard focus.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else {
+                // UI requests need a rendered pass, but must not activate the app for an agent.
+                host.raise_for_control(ctx);
+            }
+        }
         match self.handle(ctx, host, &req.method, &req.params, since) {
             Handled::Now(r) => {
                 let _ = req.reply.send(r);

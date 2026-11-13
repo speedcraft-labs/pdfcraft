@@ -787,6 +787,8 @@ pub struct PdfCraftApp {
     pub page_title: String,
     /// The UI control channel, when enabled (`--control`; off by default).
     control: Option<control::Control>,
+    /// The native host's nonactivating window raise for control-channel UI requests.
+    pub raise_without_focus: Option<fn() -> bool>,
     /// A bookmark being renamed in the Bookmarks panel: (path, text so far).
     pub bookmark_rename: Option<(Vec<usize>, String)>,
     /// Bookmarks copied or cut in the Bookmarks panel, with their subtrees, ready to paste into
