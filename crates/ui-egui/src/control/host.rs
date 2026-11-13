@@ -2,6 +2,8 @@ use super::{Host, Reply, Value, json};
 
 impl Host for crate::PdfCraftApp {
     fn raise_for_control(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::Normal));
         if let Some(raise) = self.raise_without_focus {
             raise();
         }

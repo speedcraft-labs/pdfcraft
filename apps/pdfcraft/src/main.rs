@@ -359,6 +359,11 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer,
     }
     // Started for an agent (`--control`): open without taking the user's keyboard focus.
     viewport = viewport.with_active(!agent);
+    // Keep an agent window behind normal application windows, even when eframe first shows it.
+    #[cfg(target_os = "macos")]
+    if agent {
+        viewport = viewport.with_window_level(egui::viewport::WindowLevel::AlwaysOnBottom);
+    }
     if app_frame {
         // The tab strip is the title bar (pdfcraft_ui_egui::window_controls).
         viewport = viewport.with_decorations(false);
