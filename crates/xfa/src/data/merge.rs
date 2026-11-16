@@ -51,7 +51,7 @@ struct Edit {
 }
 
 /// The edit that puts `inner` (markup) at the end of `node`'s content.
-fn append_edit(src: &str, node: roxmltree::Node, inner: &str) -> Option<Edit> {
+fn append_edit(src: &str, node: crate::xml::Node, inner: &str) -> Option<Edit> {
     let range = node.range();
     let tag_end = start_tag_end(src, &range)?;
     if tag_end.checked_add(1)? == range.end && src.get(..tag_end)?.ends_with('/') {
@@ -64,7 +64,7 @@ fn append_edit(src: &str, node: roxmltree::Node, inner: &str) -> Option<Edit> {
 }
 
 /// The edit that makes `text` (escaped) the whole content of the leaf `node`.
-fn replace_edit(src: &str, node: roxmltree::Node, text: &str) -> Option<Edit> {
+fn replace_edit(src: &str, node: crate::xml::Node, text: &str) -> Option<Edit> {
     let range = node.range();
     let tag_end = start_tag_end(src, &range)?;
     if tag_end.checked_add(1)? == range.end && src.get(..tag_end)?.ends_with('/') {
@@ -101,7 +101,7 @@ pub(super) const WRAP_CLOSE: &str = "</pdfcraft-wrap>";
 /// written.
 /// The prefix bound to the XFA data namespace where `n` is (`None`: unbound or the default
 /// namespace, which attributes can't use).
-fn xfa_prefix(n: roxmltree::Node) -> Option<String> {
+fn xfa_prefix(n: crate::xml::Node) -> Option<String> {
     n.namespaces().find(|ns| ns.uri() == XFA_DATA_NS).and_then(|ns| ns.name()).filter(|p| !p.is_empty()).map(str::to_string)
 }
 
@@ -111,7 +111,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_w
         Op::Remove(_) | Op::ReplaceData(_) | Op::Picture(..) => &[],
     };
     // Fresh data, where none exists yet (declared with the `xfa` prefix).
-    let fresh_children = |warnings: &mut Vec<String>, field_warnings: &mut Vec<DatasetFieldWarning>| match op {
+    let mut fresh_children = |warnings: &mut Vec<String>| match op {
         Op::ReplaceData(nodes) => serialize_nodes(nodes, "xfa"),
         _ => build_children(wants, warnings, field_warnings),
     };
@@ -119,15 +119,15 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_w
         warnings.push("The XFA data nests XML elements deeper than the reader accepts; the field values were not written to it".into());
         return Merged::Failed;
     }
-    let opts = || roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: MAX_NODES, ..Default::default() };
+    let opts = || crate::xml::ParsingOptions { allow_dtd: false, nodes_limit: MAX_NODES };
     // A packet of an array may use the prefixes the XDP envelope declares: read it inside
     // an element declaring the usual ones.
     let wrapped;
-    let (src, shift, parsed) = match roxmltree::Document::parse_with_options(text, opts()) {
+    let (src, shift, parsed) = match crate::xml::Document::parse_with_options(text, opts()) {
         Ok(d) => (text, 0, d),
         Err(first) => {
             wrapped = format!("{WRAP_OPEN}{text}{WRAP_CLOSE}");
-            match (within, roxmltree::Document::parse_with_options(&wrapped, opts())) {
+            match (within, crate::xml::Document::parse_with_options(&wrapped, opts())) {
                 (Within::Packet, Ok(d)) => (wrapped.as_str(), WRAP_OPEN.len(), d),
                 _ => {
                     warnings.push(format!("The XFA data could not be read ({first}); the field values were not written to it"));
@@ -136,7 +136,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_w
             }
         }
     };
-    let is = |n: &roxmltree::Node, name: &str| n.is_element() && n.tag_name().name() == name;
+    let is = |n: &crate::xml::Node, name: &str| n.is_element() && n.tag_name().name() == name;
     let datasets = parsed
         .descendants()
         .find(|n| is(n, "datasets") && n.tag_name().namespace() == Some(XFA_DATA_NS))
@@ -147,7 +147,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_w
         None if matches!(op, Op::Remove(_) | Op::Picture(..)) => return Merged::Unchanged,
         None if within == Within::Xdp => {
             let root = parsed.root_element();
-            let children = fresh_children(warnings, field_warnings);
+            let children = fresh_children(warnings);
             match append_edit(src, root, &fresh_datasets(&children)) {
                 Some(e) => edits.push(e),
                 None => {
@@ -165,7 +165,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_w
             None if matches!(op, Op::Remove(_) | Op::Picture(..)) => return Merged::Unchanged,
             None => {
                 let prefix = qname(src, &ds.range()).and_then(|q| q.split_once(':')).map(|(p, _)| format!("{p}:")).unwrap_or_default();
-                let children = fresh_children(warnings, field_warnings);
+                let children = fresh_children(warnings);
                 let element = format!("<{prefix}data>{}</{prefix}data>", children);
                 match append_edit(src, ds, &element) {
                     Some(e) => edits.push(e),
@@ -276,7 +276,7 @@ fn merge(text: &str, within: Within, op: Op, warnings: &mut Vec<String>, field_w
 /// Whether `node` is a multi-select choice list's data group: element children only, every one
 /// a `value` holding text alone; or, with no children, an element marked `xfa:dataNode=
 /// "dataGroup"`, as a group with no picks is written (XFA 3.3 p. 150).
-fn is_value_group(node: roxmltree::Node) -> bool {
+fn is_value_group(node: crate::xml::Node) -> bool {
     let blank = node.children().filter(|c| c.is_text()).all(|c| c.text().is_some_and(|t| t.trim().is_empty()));
     let mut elements = node.children().filter(|c| c.is_element()).peekable();
     if elements.peek().is_none() {
@@ -286,14 +286,14 @@ fn is_value_group(node: roxmltree::Node) -> bool {
 }
 
 /// Whether `node` carries `xfa:dataNode="dataGroup"`.
-fn marked_data_group(node: roxmltree::Node) -> bool {
+fn marked_data_group(node: crate::xml::Node) -> bool {
     node.attribute((XFA_DATA_NS, "dataNode")) == Some("dataGroup")
 }
 
 /// The edit that marks the data group `node` as one, so that emptied of its picks it still loads
 /// as a group and not as a data value (XFA 3.3 p. 150): `xfa:dataNode="dataGroup"` added to its
 /// start tag, with the namespace declared there when the packet has no prefix for it.
-fn mark_data_group_edit(src: &str, node: roxmltree::Node) -> Option<Edit> {
+fn mark_data_group_edit(src: &str, node: crate::xml::Node) -> Option<Edit> {
     let range = node.range();
     let tag_end = start_tag_end(src, &range)?;
     // Before `/>` of an empty tag, else before `>`.
@@ -314,17 +314,17 @@ fn mark_data_group_edit(src: &str, node: roxmltree::Node) -> Option<Edit> {
 /// The edits that put `wants` into the `data` element.
 fn merge_values(
     src: &str,
-    data: roxmltree::Node,
+    data: crate::xml::Node,
     wants: &[Want],
     edits: &mut Vec<Edit>,
     warnings: &mut Vec<String>,
     field_warnings: &mut Vec<DatasetFieldWarning>,
 ) {
     // Element children by local name, per element visited (built once each).
-    let mut index: HashMap<roxmltree::NodeId, HashMap<String, Vec<roxmltree::NodeId>>> = HashMap::new();
+    let mut index: HashMap<crate::xml::NodeId, HashMap<String, Vec<crate::xml::NodeId>>> = HashMap::new();
     let tree = data.document();
     // Nodes to add, per existing element they go into.
-    let mut added: Vec<(roxmltree::NodeId, Build)> = Vec::new();
+    let mut added: Vec<(crate::xml::NodeId, Build)> = Vec::new();
     let mut budget = NewNodes::new();
     for w in wants {
         let (escaped, dropped) = escape(&w.text);
@@ -333,7 +333,7 @@ fn merge_values(
         let mut have = 0;
         for (name, idx) in &w.path {
             let kids = index.entry(node.id()).or_insert_with(|| {
-                let mut by: HashMap<String, Vec<roxmltree::NodeId>> = HashMap::new();
+                let mut by: HashMap<String, Vec<crate::xml::NodeId>> = HashMap::new();
                 for c in node.children().filter(|c| c.is_element()) {
                     by.entry(c.tag_name().name().to_string()).or_default().push(c.id());
                 }
@@ -381,7 +381,7 @@ fn merge_values(
                 if needs_mark && mark.is_none() {
                     // No marker can be written (no free prefix): emptied, the group would load
                     // as a data value, so it keeps its picks and the skip is reported.
-                    skipped(warnings, STRUCTURED, &w.som);
+                    skipped_field(warnings, field_warnings, w.field, STRUCTURED, &w.som);
                     continue;
                 }
                 match replace_edit(src, node, &inner) {
@@ -401,7 +401,7 @@ fn merge_values(
                 // Ignore existing XML indentation, but not whitespace in the accepted value.
                 // A skipped mismatch must warn: relayout would otherwise use stale data.
                 if all.trim() != w.text {
-                    skipped_field(warnings, field_warnings, w.field, STRUCTURED, &w.som);
+                    skipped(warnings, STRUCTURED, &w.som);
                 }
                 continue;
             }
@@ -480,9 +480,9 @@ pub(super) fn readable(text: &str, within: Within, warnings: &mut Vec<String>) -
         warnings.push(format!("The XFA data would be larger than {} MB; it was not written", MAX_PACKET_WRITE >> 20));
         return false;
     }
-    let opts = || roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: MAX_NODES, ..Default::default() };
-    let ok = roxmltree::Document::parse_with_options(text, opts()).is_ok()
-        || (within == Within::Packet && roxmltree::Document::parse_with_options(&format!("{WRAP_OPEN}{text}{WRAP_CLOSE}"), opts()).is_ok());
+    let opts = || crate::xml::ParsingOptions { allow_dtd: false, nodes_limit: MAX_NODES };
+    let ok = crate::xml::Document::parse_with_options(text, opts()).is_ok()
+        || (within == Within::Packet && crate::xml::Document::parse_with_options(&format!("{WRAP_OPEN}{text}{WRAP_CLOSE}"), opts()).is_ok());
     if !ok {
         warnings.push("The XFA data would not be well-formed XML after this change; it was not written".into());
     }
